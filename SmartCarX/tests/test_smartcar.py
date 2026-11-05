@@ -271,8 +271,8 @@ class KeyboardTests(SmartCarTestCase):
         self.assertEqual((car.steer, car.campan, car.camtilt), (0, 0, 0))
         opened.assert_called_with(CALIBRATION_PATH, "w+")
         self.assertEqual(opened.call_count, 4)
-        last_write = "".join(c.args[0] for c in opened().write.call_args_list[-3:])
-        self.assertEqual(last_write, "-1\n2\n-1\n")
+        written = "".join(c.args[0] for c in opened().write.call_args_list)
+        self.assertTrue(written.endswith("0\n-1\n2\n-1\n"), written)
 
     def test_x_resets_speed_and_servos(self):
         car = self.make_car(drive_control=True)
@@ -424,6 +424,10 @@ class SensorAndActuatorTests(SmartCarTestCase):
         car.speed = -30
         car.handle_actuators()
         self.assertEqual(car.speed, -30)
+        car.speed = 0
+        with redirect_stdout(io.StringIO()) as out:
+            car.handle_actuators()
+        self.assertEqual(out.getvalue(), "")
         car.use_ultrasonic = False
         car.speed = 30
         car.handle_actuators()

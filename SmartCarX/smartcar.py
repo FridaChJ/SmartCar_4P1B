@@ -1,5 +1,7 @@
 """
 SmartCar class for WIP Smart Systems lecture
+version 0.10:
+Restructured the class for readability (no functional changes) and added unit tests
 version 0.9:
 Integrated new lane detection algorithm from students in summer semester 2026
 version 0.8:
@@ -21,32 +23,97 @@ Lane detection function was integrated from existing implementation 12.09.2022.
 version 0.1:
 Driving functions were integrated into the new class from existing implementation 12.09.2022.
 """
-from picarx import Picarx
-from robot_hat import ADC
-import cv2
-import numpy as np
-import time
-import copy
-from periphery import GPIO
-import socket
-import struct
 import pickle
 import select
+import socket
+import struct
+import time
+from contextlib import contextmanager
+from itertools import zip_longest
 
-# Debug constants for displayed video
-SC_DEBUG_NONE = 0 # No debug information in image
-SC_DEBUG_MASK = 1 # Show the b/w mask image
-SC_DEBUG_OVERLAY = 2 # Show the masked areas inside original image
+import cv2
+import numpy as np
+from picarx import Picarx
 
-# Options for using a window
-SC_USE_NO_WINDOW = 0 # This does not open a window or stream the video, to be used for dashboardcontrol
-SC_USE_LOCAL_WINDOW = 1 # This will open a native window, only to be used if X server is running on remote computer
-SC_USE_STREAM_WINDOW = 2 # This will open a socket server on port 50001 to stream the video to a client
+# Debug modes for the displayed video
+SC_DEBUG_NONE = 0     # Plain camera image
+SC_DEBUG_MASK = 1     # Black/white lane mask
+SC_DEBUG_OVERLAY = 2  # Lane mask painted over the camera image
+
+# How video and keyboard input are connected
+SC_USE_NO_WINDOW = 0      # Headless, e.g. for dashboard control
+SC_USE_LOCAL_WINDOW = 1   # Native OpenCV window, needs an X server on the remote computer
+SC_USE_STREAM_WINDOW = 2  # Socket server that streams video to a client and receives its keys
+
+STREAM_PORT = 5001
+CALIBRATION_FILE = "/home/mendel/SmartCarX/calibration.txt"
+
+# HSV thresholds for the blue lane tape, from students and Siavash in summer 2026.
+# Earlier tunings (lower / upper):
+#   original:       [99, 23, 65] / [123, 255, 255]
+#   Markus' home:   [105, 43, 76] / [117, 255, 255]
+#   Markus' office: [98, 79, 81] / [117, 219, 249]
+DEFAULT_LOWER_THRESHOLD = (96, 21, 81)
+DEFAULT_UPPER_THRESHOLD = (116, 219, 255)
+
+# Manual servo keys: key -> (position attribute, calibration attribute, direction)
+STEER_KEYS = {
+    "a": ("steer", "cal_steer", -1),
+    "d": ("steer", "cal_steer", +1),
+}
+CAMERA_KEYS = {
+    "f": ("campan", "cal_pan", -1),
+    "h": ("campan", "cal_pan", +1),
+    "g": ("camtilt", "cal_tilt", -1),
+    "t": ("camtilt", "cal_tilt", +1),
+}
+DRIVE_KEYS = {"w": +1, "s": -1}
+
+# Threshold tuning keys: key -> (threshold attribute, HSV channel, step)
+THRESHOLD_KEYS = {
+    "7": ("upper_threshold", 0, +1), "u": ("upper_threshold", 0, -1),
+    "8": ("upper_threshold", 1, +1), "i": ("upper_threshold", 1, -1),
+    "9": ("upper_threshold", 2, +1), "o": ("upper_threshold", 2, -1),
+    "j": ("lower_threshold", 0, +1), "m": ("lower_threshold", 0, -1),
+    "k": ("lower_threshold", 1, +1), ",": ("lower_threshold", 1, -1),
+    "l": ("lower_threshold", 2, +1), ".": ("lower_threshold", 2, -1),
+}
+
+DEBUG_IMAGE_CYCLE = {
+    SC_DEBUG_NONE: SC_DEBUG_MASK,
+    SC_DEBUG_MASK: SC_DEBUG_OVERLAY,
+    SC_DEBUG_OVERLAY: SC_DEBUG_NONE,
+}
+
+# Text overlay style (colors are BGR)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+HELP_COLOR = (180, 0, 0)
+STATUS_COLOR = (0, 0, 255)
+INFO_COLOR = (255, 100, 100)
+
 
 def sc_clamp(value, low, high):
     """Clamp a numeric value into a closed range."""
     return max(low, min(high, value))
+
+
 class SmartCar(object):
+    # Manual control
+    SPEED_STEP = 10
+    SPEED_LIMIT = 100
+    SERVO_STEP = 5
+    SERVO_LIMIT = 35
+    CENTERING_STEPS = 100
+    EMERGENCY_STOP_CM = 20
+    MAX_TRUSTED_DISTANCE_JUMP_CM = 100
+
+    # Lane detection: scan rows as fractions of the image height, from the
+    # bottom (close to the car) to the top (looking ahead)
+    SC_SCAN_ROWS = (0.80, 0.73, 0.66, 0.59, 0.52)
+    SC_MIN_PAIR_GAP_FRACTION = 0.28
+    SC_DEFAULT_LANE_WIDTH_FRACTION = 0.55
+
+    # Adaptive lane controller (Gruppe 3/8)
     SC_CURVE_SCORE_PX = 28.0
     SC_CURVE_ERROR_PX = 70.0
     SC_STRAIGHT_FILTER_ALPHA = 0.82
@@ -59,7 +126,6 @@ class SmartCar(object):
     SC_AUTO_STEER_GAIN = 0.22
     SC_AUTO_MAX_STEER_DELTA = 40.0
     SC_AUTO_TARGET_DEADBAND_PX = 14.0
-    SC_DEFAULT_LANE_WIDTH_FRACTION = 0.55
     SC_STEER_MIN = -35
     SC_STEER_CENTER = 0
     SC_STEER_MAX = 35
@@ -67,595 +133,399 @@ class SmartCar(object):
     SC_PAN_MIN = -35
     SC_PAN_CENTER = 0
     SC_PAN_MAX = 35
-    # Constructor
-    def __init__(self, drive_control = False,
-                        steer_control = False,
-                        camera_control = False,
-                        recording_control = False,
-                        use_ultrasonic = False,
-                        # original values
-                        #upper_threshold = np.array([123, 255, 255]),
-                        #lower_threshold = np.array([99, 23, 65]),
-                        # home of Markus
-                        #upper_threshold = np.array([117, 255, 255]),
-                        #lower_threshold = np.array([105, 43, 76]),
-                        # office Markus - both directions
-                        #upper_threshold = np.array([117, 219, 249]),
-                        #lower_threshold = np.array([98, 79, 81]),
-						# from students and Siavash summer 2026
-                        upper_threshold = np.array([116, 219, 255]),
-                        lower_threshold = np.array([96, 21, 81]),
-                        debug_image = SC_DEBUG_NONE,
-                        tune_thresholds = False,
-                        measure_performance = False,
-						use_window = SC_USE_STREAM_WINDOW):
-        # Initialize PiCar
+
+    def __init__(self, drive_control=False,
+                 steer_control=False,
+                 camera_control=False,
+                 recording_control=False,
+                 use_ultrasonic=False,
+                 upper_threshold=None,
+                 lower_threshold=None,
+                 debug_image=SC_DEBUG_NONE,
+                 tune_thresholds=False,
+                 measure_performance=False,
+                 use_window=SC_USE_STREAM_WINDOW):
         self.px = Picarx()
-        # Member variables
+
+        # Actuator state
         self.speed = 0
         self.steer = 0
         self.campan = 0
         self.camtilt = 0
-        self.showhelp = True
-        self.recording = False
-        self.recactivated = 0 # time in s when recording text was started to be displayed
-        self.calactivated = 0 # time in s when calibrate servos text was started to be displayed
+        self.cal_steer = 0  # Servo calibration offsets, persisted in CALIBRATION_FILE
+        self.cal_pan = 0
+        self.cal_tilt = 0
+
+        # Which keyboard controls are available
         self.drive_control = drive_control
         self.steer_control = steer_control
         self.camera_control = camera_control
         self.recording_control = recording_control
         self.use_ultrasonic = use_ultrasonic
+
+        # User interface state
+        self.showhelp = True
+        self.recording = False
+        self.calibration = False
+        self.quit = False
+        self.recactivated = 0  # Time when the blinking "recording" text was last shown
+        self.calactivated = 0  # Time when the blinking "calibrate servos" text was last shown
+        self.use_window = use_window
+        self.conn = None
+
+        # Ultrasonic distance in cm; the previous value is kept to reject outliers
         self.distance = 255
         self.last_distance = 255
-        self.quit = False
-        self.lower_threshold = lower_threshold #lower lane mask values
-        self.upper_threshold = upper_threshold #upper lane mask values
-        self.debug_image = debug_image # Show special image for debugging
-        self.tune_thresholds = tune_thresholds # With additional keys, the color thresholds can be tuned
-        self.use_window = use_window # If True, then video and kayboard inputs are tranferred via socket connection
-        self.measure_performance = measure_performance # Measure time consumptions and write to file
-        self.time_consumptions = {} # Dictionary containing time consumption lists
-        # --- Lane controller state (Gruppe 3/8 multi-row adaptive controller) --
-        self.lane_seen = False           # True while a lane target was found this frame
-        self.lane_count = 0              # 2 = pair found, 1 = single mark, 0 = nothing
-        self.lane_target_x = None        # current steering target in pixels, or None
-        self.path_mode = "search"        # "straight" | "curve" | "search"
-        self.curve_score_x = 0.0         # spread of the target between scan rows
-        self.last_left_x = None          # last known left lane mark x (for single-line classification)
-        self.last_right_x = None         # last known right lane mark x
-        self.last_lane_width = None      # last known lane width in pixels
-        self.filtered_error_x = 0.0      # EMA-filtered pixel error used by the controller
-        self.auto_error_x = 0.0          # raw (unfiltered) pixel error, for debugging/telemetry
-        self.auto_target_steer = 0       # steering angle the controller is moving toward
-        self.conn = None
-        self.calibration = False # Calibrations mode - changes calibration values for servos
-        self.cal_steer = 0
-        self.cal_pan = 0
-        self.cal_tilt = 0
-        # Create a VideoCapture object
-        """
-        The following resolutions are tested with the original pi cam:
-        640x480 (standard)
-        1920x1088 (like hd)
-        The following resolutions are officially supported by the ELP camera of the smart systems lab:
-        2592 (H) x 1944 (V) Pixel MJPEG 15 fps YUY2 3 fps
-        2048 (H) x 1536 (V) Pixel MJPEG 15PS YUY2 3 fps
-        1600 (H) x 1200 (V) Pixel MJPEG 15 fps YUY2 3 fps
-        1920 (H) x 1080 (V) Pixel MJPEG 15 fps YUY2 3 fps
-        1280 (H) x 1024 (V) Pixel MJPEG 15 fps YUY2 7.5 FPS
-        1280 (H) x 720 (V) Pixeln MJPEG 30 fps YUY2 7.5 FPS
-        1024 (H) x 768 (V) Pixeln MJPEG 30 fps YUY2 15 fps
-        800 (H) x 600 (V) Pixeln MJPEG 30 fps YUY2 30 fps
-        640 (H) x 480 (V) Pixel MJPEG 30 fps YUY2 30 fps
-        """
-        # Print additional information
-        if tune_thresholds:
-            print("You can use these keys to tune the color thresholds:")
-            print("  Upper HSV threshold +/-")
-            print("  7    8    9")
-            print("  u    i    o")
-            print("  Lower HSV threshold +/-")
-            print("  j    k    l")
-            print("  m    ,    .")
-            print("Current color tresholds")
-            print(f"{self.upper_threshold[0]} {self.upper_threshold[1]} {self.upper_threshold[2]}")
-            print(f"{self.lower_threshold[0]} {self.lower_threshold[1]} {self.lower_threshold[2]}")
-        # Create the video capture object
-        self.cap = cv2.VideoCapture(1)
-        #self.cap.set(3, 1024)  # Set horizontal resolution
-        #self.cap.set(4, 768)  # Set vertical resolution
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        # Minimize the buffer size to get more up to date images
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
-        # Set the encoder to have higher performance (frame rate) while reading images
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        # Check if camera opened successfully
-        if (self.cap.isOpened() == False): 
-            print("Unable to read camera feed")
-        # Default resolutions of the frame are obtained.The default resolutions are system dependent.
-        # We convert the resolutions from float to integer.
-        self.frame_width = int(self.cap.get(3))
-        self.frame_height = int(self.cap.get(4))
-        # Video writer initially None
-        self.out = None
-        # Read calibration values and apply servo values
-        try:
-            f = open("/home/mendel/SmartCarX/calibration.txt", "r")
-            self.cal_steer = int(f.readline())
-            self.cal_pan = int(f.readline())
-            self.cal_tilt = int(f.readline())
-            f.close()
-            self.handle_servos()
-        except FileNotFoundError:
-            pass
-        # On demand, open the socket connection (server)
-        if self.use_window == SC_USE_STREAM_WINDOW:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('0.0.0.0', 5001))
-            self.server_socket.listen(5)
-            print("Server listening on 0.0.0.0:5001")
-            print("Please start your client program on remote computer and connect to the SmartCar IP Address.")
-            while True:
-                self.conn, self.addr = self.server_socket.accept()
-                print(f"Connection from: {self.addr}")
-                #self.conn.settimeout(0.1)  # Prevent blocking - original value 0.1 which means seconds
-                break
 
-    # Destructor
+        # Lane mask color range (HSV) and debugging options
+        self.upper_threshold = np.array(DEFAULT_UPPER_THRESHOLD) if upper_threshold is None else upper_threshold
+        self.lower_threshold = np.array(DEFAULT_LOWER_THRESHOLD) if lower_threshold is None else lower_threshold
+        self.debug_image = debug_image
+        self.tune_thresholds = tune_thresholds
+        self.measure_performance = measure_performance
+        self.time_consumptions = {}  # Block name -> list of measured durations in s
+
+        # Lane controller state (Gruppe 3/8 multi-row adaptive controller)
+        self.lane_seen = False        # True while a lane target was found this frame
+        self.lane_count = 0           # 2 = pair found, 1 = single mark, 0 = nothing
+        self.lane_target_x = None     # Current steering target in pixels, or None
+        self.path_mode = "search"     # "straight" | "curve" | "search"
+        self.curve_score_x = 0.0      # Spread of the target between scan rows
+        self.last_left_x = None       # Last known lane marks, to classify a single visible line
+        self.last_right_x = None
+        self.last_lane_width = None   # Last known lane width in pixels
+        self.filtered_error_x = 0.0   # EMA-filtered pixel error used by the controller
+        self.auto_error_x = 0.0       # Raw pixel error, for debugging/telemetry
+        self.auto_target_steer = 0    # Steering angle the controller is moving toward
+
+        if tune_thresholds:
+            self._print_threshold_help()
+        self._open_camera()
+        self.out = None  # Video writer while recording
+        self._read_calibfile()
+        if use_window == SC_USE_STREAM_WINDOW:
+            self._start_stream_server()
+
     def __del__(self):
         print("Destructor called")
-        # Write the time consumptions to a csv file
         if self.measure_performance:
-            # Create the file
-            now = time.time() # get snapshot of current time
-            lt = time.localtime(now) # convert to local time struct
-            filename = "time_consumption-" + time.strftime("%Y-%m-%d-%H-%M-%S", lt) + ".csv"
-            time_consumption_file = open(filename, "w+")
-            # Write the header
-            firstkey = True
-            for key in self.time_consumptions:
-                if not firstkey:
-                    time_consumption_file.write(";")
-                firstkey = False
-                time_consumption_file.write(key)
-            time_consumption_file.write("\n")
-            # Write the data lines
-            line_index = 0
-            data_found = True
-            while data_found:
-                data_found = False
-                # Take data for each existing key
-                firstkey = True
-                for key in self.time_consumptions:
-                    if not firstkey:
-                        time_consumption_file.write(";")
-                    firstkey = False
-                    datastr2 = "end"
-                    if len(self.time_consumptions[key]) > line_index:
-                        data_found = True
-                        datastr = str(self.time_consumptions[key][line_index])
-                        datastr2 = datastr.replace(".", ",")
-                    time_consumption_file.write(datastr2)
-                time_consumption_file.write("\n")
-                line_index += 1
-            time_consumption_file.close()
-        # When everything done, release the video capture and video write objects
+            self._write_time_consumptions()
         self.cap.release()
         if self.use_window == SC_USE_STREAM_WINDOW and self.conn:
             self.conn.close()
-        if self.out != None:
+        if self.out is not None:
             self.out.release()
-        # Closes all the frames
         cv2.destroyAllWindows()
-        # Cleanup GPIO at the end
-        #GPIO.cleanup()
-        #reset the hardware
+        # Leave the hardware stopped and centered
         self.px.stop()
-        self.steer = 0
-        self.campan = 0
-        self.camtilt = 0
+        self.steer = self.campan = self.camtilt = 0
         self.handle_servos()
 
-    # Adds the help text to the frame
-    # cv2frame: an image as a numpy array in which the text will be drawn
-    # text: The text that shall be displayed (list of strings)
-    def addhelp(self):
-        # Define the help text depending on available controls
-        text = ["Usage of the car control:",
-                "show or hide this help: ?"]
-        if self.drive_control or self.steer_control or self.camera_control:
-            text.append("reset actuators: x")
-        text.append("quit program: q")
-        if self.drive_control:
-            text.append("speed up: w")
-            text.append("speed down: s")
-        calib_printed = False
-        if self.steer_control:
-            text.append("left/right: a/d")
-            text.append("servo calibration: c")
-            calib_printed = True
-        if self.camera_control:
-            text.append("camera up: t")
-            text.append("camera left/right: f/h")
-            text.append("camera down: g")
-            if not calib_printed:
-                text.append("servo calibration: c")
-        if self.recording_control:
-            text.append("start or stop recording: r")
-        if self.use_ultrasonic:
-            text.append(f"us distance: {self.distance:.1f}cm")
-        calib_printed = False
-        # Render the text into the frame
-        font                   = cv2.FONT_HERSHEY_SIMPLEX
-        bottomLeftCornerOfText = (10,20)
-        fontScale              = 0.5
-        fontColor              = (180,0,0)
-        lineType               = 2
-        linepos = 0
-        for line in text:
-            bottomLeftCornerOfText = (10,20+linepos*20)
-            cv2.putText(self.frame, line, 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
-            linepos = linepos + 1
+    # ------------------------------------------------------------------
+    # Setup and persistence
+    # ------------------------------------------------------------------
 
-    # Adds the "blinking" recording text in red color to a frame
-    # Must be called cyclically to work
-    # cv2frame: an image as a numpy array in which the text will be drawn
-    def addrecording(self):
-        # show text for 0.5s
-        if self.recactivated > time.time()-0.5:
-            font                   = cv2.FONT_HERSHEY_SIMPLEX
-            bottomLeftCornerOfText = (10,self.frame_height-40)
-            fontScale              = 0.5
-            fontColor              = (0,0,255)
-            lineType               = 2
-            linepos = 0
-            cv2.putText(self.frame, "recording", 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
-        else:
-            if self.recactivated < time.time()-1:
-                self.recactivated = time.time()
+    def _open_camera(self):
+        # Resolutions tested with the original Pi cam: 640x480 (default), 1920x1088.
+        # The ELP camera of the smart systems lab supports MJPEG up to 2592x1944 @ 15 fps,
+        # and 30 fps up to 1280x720.
+        self.cap = cv2.VideoCapture(1)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # A one-frame buffer keeps images up to date; MJPG gives the best frame rate
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if not self.cap.isOpened():
+            print("Unable to read camera feed")
+        self.frame_width = int(self.cap.get(3))
+        self.frame_height = int(self.cap.get(4))
 
-    # Adds the "blinking" calibrate servos text in red color to a frame
-    # Must be called cyclically to work
-    # cv2frame: an image as a numpy array in which the text will be drawn
-    def addcalibrating(self):
-        # show text for 0.5s
-        if self.calactivated > time.time()-0.5:
-            font                   = cv2.FONT_HERSHEY_SIMPLEX
-            bottomLeftCornerOfText = (10,self.frame_height-60)
-            fontScale              = 0.5
-            fontColor              = (0,0,255)
-            lineType               = 2
-            linepos = 0
-            cv2.putText(self.frame, "calibrate servos", 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
-        else:
-            if self.calactivated < time.time()-1:
-                self.calactivated = time.time()
+    def _read_calibfile(self):
+        """Load servo calibration offsets, if saved, and apply them."""
+        try:
+            with open(CALIBRATION_FILE, "r") as f:
+                self.cal_steer, self.cal_pan, self.cal_tilt = (int(f.readline()) for _ in range(3))
+        except FileNotFoundError:
+            return
+        self.handle_servos()
 
     def write_calibfile(self):
-            f = open("/home/mendel/SmartCarX/calibration.txt", "w+")
-            f.write(str(self.cal_steer) + "\n")
-            f.write(str(self.cal_pan) + "\n")
-            f.write(str(self.cal_tilt) + "\n")
-            f.close()
+        with open(CALIBRATION_FILE, "w+") as f:
+            f.write(f"{self.cal_steer}\n{self.cal_pan}\n{self.cal_tilt}\n")
 
-    # Adds additional text to the window
+    def _print_threshold_help(self):
+        print("You can use these keys to tune the color thresholds:")
+        print("  Upper HSV threshold +/-")
+        print("  7    8    9")
+        print("  u    i    o")
+        print("  Lower HSV threshold +/-")
+        print("  j    k    l")
+        print("  m    ,    .")
+        print("Current color tresholds")
+        self._print_thresholds()
+
+    def _print_thresholds(self):
+        upper, lower = self.upper_threshold, self.lower_threshold
+        print(f"{upper[0]} {upper[1]} {upper[2]}")
+        print(f"{lower[0]} {lower[1]} {lower[2]}")
+
+    def _write_time_consumptions(self):
+        """Write the measured durations to a CSV file, one column per code block.
+
+        Uses ';' as separator and ',' as decimal mark (German spreadsheet format).
+        Shorter columns are padded with "end", and an all-"end" row closes the file.
+        """
+        filename = time.strftime("time_consumption-%Y-%m-%d-%H-%M-%S.csv", time.localtime(time.time()))
+        columns = list(self.time_consumptions.values())
+        with open(filename, "w+") as f:
+            f.write(";".join(self.time_consumptions) + "\n")
+            for row in zip_longest(*columns, fillvalue="end"):
+                f.write(";".join(str(value).replace(".", ",") for value in row) + "\n")
+            f.write(";".join("end" for _ in columns) + "\n")
+
+    # ------------------------------------------------------------------
+    # Video stream server
+    # ------------------------------------------------------------------
+
+    def _start_stream_server(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(("0.0.0.0", STREAM_PORT))
+        self.server_socket.listen(5)
+        self._wait_for_client()
+
+    def _wait_for_client(self):
+        """Block until a remote client connects."""
+        print(f"Server listening on 0.0.0.0:{STREAM_PORT}")
+        print("Please start your client program on remote computer and connect to the SmartCar IP Address.")
+        self.conn, self.addr = self.server_socket.accept()
+        print(f"Connection from: {self.addr}")
+
+    def _send_frame(self):
+        # Wire format: b"IMG" + 4-byte big-endian length + pickled JPEG buffer
+        try:
+            _, buffer = cv2.imencode(".jpg", self.frame)
+            data = pickle.dumps(buffer)
+            self.conn.sendall(b"IMG" + struct.pack(">L", len(data)) + data)
+        except BrokenPipeError:
+            self._wait_for_client()
+
+    # ------------------------------------------------------------------
+    # Window overlays
+    # ------------------------------------------------------------------
+
+    def _put_text(self, text, origin, color):
+        cv2.putText(self.frame, text, origin, FONT, 0.5, color, 2)
+
+    def _help_lines(self):
+        """Help text listing only the controls that are currently available."""
+        lines = ["Usage of the car control:", "show or hide this help: ?"]
+        if self.drive_control or self.steer_control or self.camera_control:
+            lines.append("reset actuators: x")
+        lines.append("quit program: q")
+        if self.drive_control:
+            lines += ["speed up: w", "speed down: s"]
+        if self.steer_control:
+            lines += ["left/right: a/d", "servo calibration: c"]
+        if self.camera_control:
+            lines += ["camera up: t", "camera left/right: f/h", "camera down: g"]
+            if not self.steer_control:
+                lines.append("servo calibration: c")
+        if self.recording_control:
+            lines.append("start or stop recording: r")
+        if self.use_ultrasonic:
+            lines.append(f"us distance: {self.distance:.1f}cm")
+        return lines
+
+    def addhelp(self):
+        for index, line in enumerate(self._help_lines()):
+            self._put_text(line, (10, 20 + index * 20), HELP_COLOR)
+
+    def _blink_text(self, text, offset_from_bottom, shown_since):
+        """Show `text` for 0.5s out of every second. Must be called every frame.
+
+        Returns the updated timestamp of when the current blink cycle started.
+        """
+        now = time.time()
+        if shown_since > now - 0.5:
+            self._put_text(text, (10, self.frame_height - offset_from_bottom), STATUS_COLOR)
+        elif shown_since < now - 1:
+            return now
+        return shown_since
+
     def add_text(self, text):
         if text != "":
-            font                   = cv2.FONT_HERSHEY_SIMPLEX
-            fontScale              = 0.5
-            fontColor              = (255,100,100)
-            lineType               = 2
-            bottomLeftCornerOfText = (150,self.frame_height-40)
-            cv2.putText(self.frame, text, 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
+            self._put_text(text, (150, self.frame_height - 40), INFO_COLOR)
 
-    # Measures the ultrasonic sensor distance
-    # Stores it in self.distance
-    # self.distance is backed up before in self.last_distance
+    # ------------------------------------------------------------------
+    # Main loop steps: sensors -> (lane detection) -> window -> input -> actuators
+    # ------------------------------------------------------------------
+
+    def handle_sensors(self):
+        """Grab a fresh camera frame and, if enabled, the ultrasonic distance."""
+        with self._timed("handle_sensors.capture_image"):
+            self.cap.read()  # Discard the buffered frame, it may be stale
+            self.ret, self.frame = self.cap.read()
+        with self._timed("handle_sensors.measure_us_distance"):
+            if self.use_ultrasonic:
+                self.measure_us_distance()
+
     def measure_us_distance(self):
-        # Read distance in cm
+        """Store the ultrasonic distance in cm, keeping the previous one in last_distance."""
         d = round(self.px.ultrasonic.read(), 2)
-        # d=-1 means error in signal. d=-2 means timeout (max distance)
+        # The sensor reports -1 for a signal error (ignored) and -2 for a timeout (max distance)
         if d <= -2:
-            d = 255 # Max distance
+            d = 255
         if d >= 0:
-            # Store last measurement
             self.last_distance = self.distance
-            # Store measurement
             self.distance = d
 
-    # Read camera stream and us sensor
-    def handle_sensors(self):
-        self.start_timer("handle_sensors.capture_image")
-        self.cap.read()
-        self.ret, self.frame = self.cap.read()
-        self.stop_timer("handle_sensors.capture_image")
-        self.start_timer("handle_sensors.measure_us_distance")
-        if self.use_ultrasonic:
-            self.measure_us_distance()
-        self.stop_timer("handle_sensors.measure_us_distance")
-        
-    # Show the window
-    def handle_window(self, additional_text = ""):
-        if self.ret == True:
-            self.start_timer("handle_window.add_text")
-            # Add the optional text to the image
+    def handle_window(self, additional_text=""):
+        """Draw the overlays and show the frame locally or send it to the stream client."""
+        if not self.ret:
+            return
+        with self._timed("handle_window.add_text"):
             self.add_text(additional_text)
-            self.stop_timer("handle_window.add_text")
-            self.start_timer("handle_window.copy_frame")
-            # copy the frame for showing text only in window and not in recording
-            self.recordingframe = copy.copy(self.frame)
-            self.stop_timer("handle_window.copy_frame")
-            self.start_timer("handle_window.showhelp")
-            # on demand, show the help text
-            if self.showhelp and (self.use_window == SC_USE_LOCAL_WINDOW or self.use_window == SC_USE_STREAM_WINDOW):
+        with self._timed("handle_window.copy_frame"):
+            # The remaining overlays are only for the viewer, not for the recording
+            self.recordingframe = self.frame.copy()
+        with self._timed("handle_window.showhelp"):
+            if self.showhelp and self.use_window in (SC_USE_LOCAL_WINDOW, SC_USE_STREAM_WINDOW):
                 self.addhelp()
-            self.stop_timer("handle_window.showhelp")
-            self.start_timer("handle_window.addrecording")
-            # on demand, show the recording text
+        with self._timed("handle_window.addrecording"):
             if self.recording:
-                self.addrecording()
+                self.recactivated = self._blink_text("recording", 40, self.recactivated)
             if self.calibration:
-                self.addcalibrating()
-            self.stop_timer("handle_window.addrecording")
-            self.start_timer("handle_window.imshow")
-            # Display the resulting frame
+                self.calactivated = self._blink_text("calibrate servos", 60, self.calactivated)
+        with self._timed("handle_window.imshow"):
             if self.use_window == SC_USE_STREAM_WINDOW:
-                # Send the stream to client
-                try:
-                    _, buffer = cv2.imencode('.jpg', self.frame)
-                    data = pickle.dumps(buffer)
-                    size = struct.pack(">L", len(data))
-                    self.conn.sendall(b'IMG' + size + data)  # Send frame
-                except BrokenPipeError:
-                    # The client is not connected any longer
-                    print("Server listening on 0.0.0.0:5001")
-                    print("Please start your client program on remote computer and connect to the SmartCar IP Address.")
-                    while True:
-                        self.conn, self.addr = self.server_socket.accept()
-                        print(f"Connection from: {self.addr}")
-                        #self.conn.settimeout(0.1)  # Prevent blocking - original value 0.1 which means seconds
-                        break
+                self._send_frame()
             elif self.use_window == SC_USE_LOCAL_WINDOW:
-                cv2.imshow('SmartCar camera',self.frame)
-            self.stop_timer("handle_window.imshow")
+                cv2.imshow("SmartCar camera", self.frame)
 
-    # Handle the user input
     def user_command(self):
-        self.start_timer("user_command")
-        key = None
-        calibrate_done = False # Needed because in two lines the key "c" is handled
+        """Read one key (if any) and apply it to the available controls."""
+        with self._timed("user_command"):
+            key = self._read_key()
+            if key == "q":
+                self.quit = True
+            if self.drive_control and key in DRIVE_KEYS:
+                self._change_speed(DRIVE_KEYS[key])
+            if self.steer_control and key in STEER_KEYS:
+                self._nudge_servo(*STEER_KEYS[key])
+            if self.camera_control and key in CAMERA_KEYS:
+                self._nudge_servo(*CAMERA_KEYS[key])
+            if self.steer_control or self.camera_control:
+                if key == "c":
+                    self._toggle_calibration()
+            if self.drive_control or self.steer_control or self.camera_control:
+                if key == "x":
+                    self.speed = 0
+                    self.center_servos()
+            if key == "?":
+                self.showhelp = not self.showhelp
+            if self.recording_control and key == "r":
+                self._toggle_recording()
+            if self.tune_thresholds and key in THRESHOLD_KEYS:
+                self._tune_threshold(*THRESHOLD_KEYS[key])
+            if key == "y":  # Secret key to cycle through the debug images
+                self.debug_image = DEBUG_IMAGE_CYCLE[self.debug_image]
+
+    def _read_key(self):
+        """Return the pressed key as a one-character string, or None."""
         if self.use_window == SC_USE_STREAM_WINDOW:
-            # Use select to check if data is available (non-blocking)
             readable, _, _ = select.select([self.conn], [], [], 0.1)
             if readable:
                 try:
-                    key = self.conn.recv(1).decode('utf-8')  # Read 1-byte key input
-                    if key:
-                        print(f"Received key: {key}")  # Process key input here
-                        key = ord(key)
-                except:
-                    pass  # Ignore small errors
+                    key = self.conn.recv(1).decode("utf-8")
+                except Exception:
+                    return None  # Ignore glitches on the connection
+                if key:
+                    print(f"Received key: {key}")
+                    return key
         elif self.use_window == SC_USE_LOCAL_WINDOW:
-            # catch the key
-            key = cv2.waitKey(1) & 0xFF
-        # Press q on keyboard to stop program
-        if key == ord('q'):
-            self.quit = True
-        # driving commands
-        if self.drive_control:
-            if key == ord('w'):
-                self.speed = self.speed + 10
-                if self.speed > 100:
-                    self.speed = 100
-                print("speed:", self.speed)
-            elif key == ord('s'):
-                self.speed = self.speed - 10
-                if self.speed < -100:
-                    self.speed = -100
-                print("speed:", self.speed)
-        # steering commands
-        if self.steer_control:
-            if key == ord('a'):
-                if self.calibration:
-                    self.cal_steer -=1
-                    self.write_calibfile()
-                else:
-                    self.steer -= 5
-                if self.steer < -35:
-                    self.steer = -35
-                print("steer:", self.steer)
-            elif key == ord('d'):
-                if self.calibration:
-                    self.cal_steer +=1
-                    self.write_calibfile()
-                else:
-                    self.steer += 5
-                if self.steer > 35:
-                    self.steer = 35
-                print("steer:", self.steer)
-            elif key == ord('c'):
-                self.calibration = not self.calibration
-                if self.calibration:
-                    self.center_servos()
-                calibrate_done = True # Key already handled here, suppress for camera handling
-        # camera commands
-        if self.camera_control:
-            if key == ord('h'):
-                if self.calibration:
-                    self.cal_pan +=1
-                    self.write_calibfile()
-                else:
-                    self.campan += 5
-                if self.campan > 35:
-                    self.campan = 35
-                print("campan:", self.campan)
-            elif key == ord('f'):
-                if self.calibration:
-                    self.cal_pan -=1
-                    self.write_calibfile()
-                else:
-                    self.campan -= 5
-                if self.campan < -35:
-                    self.campan = -35
-                print("campan:", self.campan)
-            elif key == ord('g'):
-                if self.calibration:
-                    self.cal_tilt -=1
-                    self.write_calibfile()
-                else:
-                    self.camtilt -= 5
-                if self.camtilt < -35:
-                    self.camtilt = -35
-                print("camtilt:", self.camtilt)
-            elif key == ord('t'):
-                if self.calibration:
-                    self.cal_tilt +=1
-                    self.write_calibfile()
-                else:
-                    self.camtilt += 5
-                if self.camtilt > 35:
-                    self.camtilt = 35
-                print("camtilt:", self.camtilt)
-            elif key == ord('c') and not calibrate_done:
-                self.calibration = not self.calibration
-                if self.calibration:
-                    self.center_servos()
-        if self.drive_control or self.steer_control or self.camera_control:
-            if key == ord('x'):
+            return chr(cv2.waitKey(1) & 0xFF)
+        return None
+
+    def _change_speed(self, direction):
+        self.speed = sc_clamp(self.speed + direction * self.SPEED_STEP, -self.SPEED_LIMIT, self.SPEED_LIMIT)
+        print("speed:", self.speed)
+
+    def _nudge_servo(self, position_attr, calibration_attr, direction):
+        """Move a servo one step, or adjust and save its calibration offset in calibration mode."""
+        if self.calibration:
+            setattr(self, calibration_attr, getattr(self, calibration_attr) + direction)
+            self.write_calibfile()
+        else:
+            position = getattr(self, position_attr) + direction * self.SERVO_STEP
+            setattr(self, position_attr, sc_clamp(position, -self.SERVO_LIMIT, self.SERVO_LIMIT))
+        print(f"{position_attr}:", getattr(self, position_attr))
+
+    def _toggle_calibration(self):
+        self.calibration = not self.calibration
+        if self.calibration:
+            self.center_servos()
+
+    def _toggle_recording(self):
+        if self.recording:
+            if self.out is not None:
+                self.out.release()
+        else:
+            filename = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time())) + ".avi"
+            self.out = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc("M", "J", "P", "G"), 10,
+                                       (self.frame_width, self.frame_height))
+        self.recording = not self.recording
+
+    def _tune_threshold(self, threshold_attr, channel, step):
+        getattr(self, threshold_attr)[channel] += step
+        self._print_thresholds()
+
+    def handle_actuators(self):
+        """Apply speed and servo angles to the car and record the frame if requested."""
+        with self._timed("handle_actuators"):
+            if self._obstacle_ahead():
+                print(f"stopped because d = {self.distance}")
+                print(f"Last distance was d = {self.last_distance}")
                 self.speed = 0
-                self.center_servos()
-        if key == ord('?'):
-            self.showhelp = not self.showhelp
-        if self.recording_control:
-            if key == ord('r'):
-                if self.recording:
-                    if self.out != None:
-                        self.out.release()
-                else:
-                    now = time.time() # get snapshot of current time
-                    lt = time.localtime(now) # convert to local time struct
-                    filename = time.strftime("%Y-%m-%d-%H-%M-%S", lt) + ".avi"
-                    # Define the codec and create VideoWriter object.The output is stored in 'outpy.avi' file.
-                    self.out = cv2.VideoWriter(filename,cv2.VideoWriter_fourcc('M','J','P','G'), 10, (self.frame_width,self.frame_height))
-                    textactivated = time.time()
-                self.recording = not self.recording
-        if self.tune_thresholds:
-            print_it = False
-            if key == ord('7'):
-                self.upper_threshold[0] = self.upper_threshold[0] + 1
-                print_it = True
-            elif key == ord('u'):
-                self.upper_threshold[0] = self.upper_threshold[0] - 1
-                print_it = True
-            elif key == ord('j'):
-                self.lower_threshold[0] = self.lower_threshold[0] + 1
-                print_it = True
-            elif key == ord('m'):
-                self.lower_threshold[0] = self.lower_threshold[0] - 1
-                print_it = True
-            elif key == ord('8'):
-                self.upper_threshold[1] = self.upper_threshold[1] + 1
-                print_it = True
-            elif key == ord('i'):
-                self.upper_threshold[1] = self.upper_threshold[1] - 1
-                print_it = True
-            elif key == ord('k'):
-                self.lower_threshold[1] = self.lower_threshold[1] + 1
-                print_it = True
-            elif key == ord(','):
-                self.lower_threshold[1] = self.lower_threshold[1] - 1
-                print_it = True
-            elif key == ord('9'):
-                self.upper_threshold[2] = self.upper_threshold[2] + 1
-                print_it = True
-            elif key == ord('o'):
-                self.upper_threshold[2] = self.upper_threshold[2] - 1
-                print_it = True
-            elif key == ord('l'):
-                self.lower_threshold[2] = self.lower_threshold[2] + 1
-                print_it = True
-            elif key == ord('.'):
-                self.lower_threshold[2] = self.lower_threshold[2] - 1
-                print_it = True
-            if print_it:
-                print(f"{self.upper_threshold[0]} {self.upper_threshold[1]} {self.upper_threshold[2]}")
-                print(f"{self.lower_threshold[0]} {self.lower_threshold[1]} {self.lower_threshold[2]}")
-        # Secrect commands for switching debug image modes
-        if key == ord('y'):
-            if self.debug_image == SC_DEBUG_NONE:
-                self.debug_image = SC_DEBUG_MASK
-            elif self.debug_image == SC_DEBUG_MASK:
-                self.debug_image = SC_DEBUG_OVERLAY
-            elif self.debug_image == SC_DEBUG_OVERLAY:
-                self.debug_image = SC_DEBUG_NONE
-        self.stop_timer("user_command")
+            if self.speed < 0:
+                self.px.backward(abs(self.speed))
+            else:
+                self.px.forward(self.speed)
+            self.handle_servos()
+            if self.recording:
+                self.out.write(self.recordingframe)
+
+    def _obstacle_ahead(self):
+        """True if driving forward towards a close obstacle.
+
+        Readings that jumped by more than MAX_TRUSTED_DISTANCE_JUMP_CM since
+        the last measurement are treated as sensor glitches.
+        """
+        return (self.use_ultrasonic
+                and self.speed > 0
+                and self.distance < self.EMERGENCY_STOP_CM
+                and abs(self.last_distance - self.distance) < self.MAX_TRUSTED_DISTANCE_JUMP_CM)
 
     def handle_servos(self):
-        self.px.set_dir_servo_angle(min(max(self.steer+self.cal_steer, -35), 35))
-        self.px.set_cam_pan_angle(min(max(self.campan+self.cal_pan, -35), 35))
-        self.px.set_cam_tilt_angle(min(max(self.camtilt+self.cal_tilt, -35), 35))
+        """Send the servo angles plus calibration offsets to the hardware."""
+        limit = self.SERVO_LIMIT
+        self.px.set_dir_servo_angle(sc_clamp(self.steer + self.cal_steer, -limit, limit))
+        self.px.set_cam_pan_angle(sc_clamp(self.campan + self.cal_pan, -limit, limit))
+        self.px.set_cam_tilt_angle(sc_clamp(self.camtilt + self.cal_tilt, -limit, limit))
 
     def center_servos(self):
-        # Center servos softly
-        orig_values = [self.steer, self.campan, self.camtilt]
-        steps = 100
+        """Move all servos softly back to their center position."""
+        start = (self.steer, self.campan, self.camtilt)
+        steps = self.CENTERING_STEPS
         for i in range(steps):
-            self.steer = int(orig_values[0] + (0-orig_values[0])*i/steps)
-            self.campan = int(orig_values[1] + (0-orig_values[1])*i/steps)
-            self.camtilt = int(orig_values[2] + (0-orig_values[2])*i/steps)
+            self.steer, self.campan, self.camtilt = (int(v - v * i / steps) for v in start)
             self.handle_servos()
-            #time.sleep(0.2)
-        self.steer = 0
-        self.campan = 0
-        self.camtilt = 0
+        self.steer = self.campan = self.camtilt = 0
         self.handle_servos()
 
-    # Apply the values to the PiCar actuators
-    def handle_actuators(self):
-        self.start_timer("handle_actuators")
-        # Stop the vehicle if:
-        # a) US distance is smaller than 20cm AND
-        # b) Car drives forward
-        # c) Measurement is trustful (no steps > 100cm)
-        if self.distance < 20 and self.speed > 0 and abs(self.last_distance-self.distance) < 100 and self.use_ultrasonic:
-            print(f"stopped because d = {self.distance}")
-            print(f"Last distance was d = {self.last_distance}")
-            self.speed = 0
-        # apply the values to the hardware
-        if self.speed < 0:
-            self.px.backward(abs(self.speed))
-            #self.gpio_p13.write(True)
-        else:
-            self.px.forward(self.speed)
-            #self.gpio_p13.write(False)
-        self.handle_servos()
-        # Write the frame into the file
-        if self.recording:
-            self.out.write(self.recordingframe)
-        self.stop_timer("handle_actuators")
+    # ------------------------------------------------------------------
+    # Lane detection and automatic steering
+    # ------------------------------------------------------------------
 
-    # Detects the lanes and calculates steering angle automatically
     def lane_detection(self):
         """Detect the blue lane markings and steer/pan the car automatically.
 
@@ -671,51 +541,43 @@ class SmartCar(object):
         != 0), mirroring the old PID controller's behaviour. When stopped,
         the last steering angle is held.
         """
-        self.start_timer("lane_detection.hsv")
-        original = self.frame
-        hsv = cv2.cvtColor(original, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.lower_threshold, self.upper_threshold)
-        self.stop_timer("lane_detection.hsv")
+        with self._timed("lane_detection.hsv"):
+            hsv = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, self.lower_threshold, self.upper_threshold)
 
-        self.start_timer("lane_detection.mask")
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        self.stop_timer("lane_detection.mask")
+        with self._timed("lane_detection.mask"):
+            # Remove speckles, then close small gaps in the tape
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        self.start_timer("lane_detection.debugimage")
-        if self.debug_image == SC_DEBUG_MASK:
-            self.frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        elif self.debug_image == SC_DEBUG_OVERLAY:
-            # New and wrong code:
-            #overlay = np.zeros_like(original)
-            #overlay[:, :, 0] = mask
-            #self.frame = cv2.addWeighted(original, 0.75, overlay, 0.45, 0)
-            # Old and working code:
-            line_color = (0, 0, 200)
-            mask_as_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            self.frame = np.bitwise_or(self.frame, mask_as_bgr)
-        else:
-            self.frame = original
-        self.stop_timer("lane_detection.debugimage")
+        with self._timed("lane_detection.debugimage"):
+            if self.debug_image == SC_DEBUG_MASK:
+                self.frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            elif self.debug_image == SC_DEBUG_OVERLAY:
+                self.frame = np.bitwise_or(self.frame, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
 
-        self.start_timer("lane_detection.detect_lanes")
-        height, width = self.frame.shape[:2]
-        rows = [
-            int(height * 0.80),
-            int(height * 0.73),
-            int(height * 0.66),
-            int(height * 0.59),
-            int(height * 0.52),
-        ]
+        with self._timed("lane_detection.detect_lanes"):
+            height, width = self.frame.shape[:2]
+            pairs, marks, marks_row = self._scan_rows(mask, height, width)
+            self._update_lane_target(pairs, marks, width)
+            self._draw_lane_target(height, width, marks_row)
 
-        min_pair_gap = int(width * 0.28)
-        pair_targets = []
-        best_marks = []
-        best_row = rows[0]
+        with self._timed("lane_detection.controller"):
+            if self.speed != 0:
+                self._lane_auto_steer(width)
 
-        for index, row in enumerate(rows):
-            row = int(sc_clamp(row, 0, height - 1))
+    def _scan_rows(self, mask, height, width):
+        """Look for lane marks along each scan row, nearest row first.
+
+        Returns the lane pair (left, right) of every row that has one, plus
+        the marks and y position of the nearest row with any marks at all.
+        """
+        min_pair_gap = int(width * self.SC_MIN_PAIR_GAP_FRACTION)
+        rows = [int(height * fraction) for fraction in self.SC_SCAN_ROWS]
+        pairs = []
+        nearest_marks, nearest_row = [], rows[0]
+        for row in rows:
             marks = self._extract_lane_marks(mask, row)
             cv2.line(self.frame, (0, row), (width - 1, row), (70, 70, 70), 1)
             for mark in marks:
@@ -723,121 +585,87 @@ class SmartCar(object):
 
             pair = self._choose_lane_pair(marks, min_pair_gap)
             if pair:
-                left, right = pair
-                target = (float(left) + float(right)) / 2.0
-                pair_targets.append((index, target, left, right))
-                if not best_marks:
-                    best_marks = marks
-                    best_row = row
-            elif marks and not best_marks:
-                best_marks = marks
-                best_row = row
+                pairs.append(pair)
+            if marks and not nearest_marks:
+                nearest_marks, nearest_row = marks, row
+        return pairs, nearest_marks, nearest_row
 
-        self.lane_seen = False
-        self.lane_count = 0
-        target = None
-
-        if pair_targets:
+    def _update_lane_target(self, pairs, marks, width):
+        """Choose the steering target (lane_target_x) and update the lane state."""
+        self.lane_seen = bool(pairs or marks)
+        if pairs:
             # Lower rows are close to the robot; upper rows look ahead.
             # Blend both: stable on straights, earlier response in curves.
-            first_i, first_t, first_l, first_r = pair_targets[0]
-            last_i, last_t, last_l, last_r = pair_targets[-1]
-            avg_t = sum(t for _, t, _, _ in pair_targets) / float(len(pair_targets))
-            self.curve_score_x = abs(last_t - first_t)
-
+            targets = [(float(left) + float(right)) / 2.0 for left, right in pairs]
+            near, far = targets[0], targets[-1]
+            average = sum(targets) / float(len(targets))
+            self.curve_score_x = abs(far - near)
             if self.curve_score_x >= self.SC_CURVE_SCORE_PX:
-                target = 0.45 * first_t + 0.35 * avg_t + 0.20 * last_t
                 self.path_mode = "curve"
+                target = 0.45 * near + 0.35 * average + 0.20 * far
             else:
-                target = 0.70 * first_t + 0.30 * avg_t
                 self.path_mode = "straight"
+                target = 0.70 * near + 0.30 * average
 
-            self.lane_seen = True
+            left, right = pairs[0]
             self.lane_count = 2
-            self.last_left_x = int(first_l)
-            self.last_right_x = int(first_r)
-            self.last_lane_width = float(max(1, first_r - first_l))
-        elif best_marks:
-            marks_sorted = sorted(best_marks)
-            self.lane_seen = True
-            self.lane_count = len(marks_sorted)
-            self.path_mode = "search"
-            self.curve_score_x = 0.0
-
-            selected_x = float(marks_sorted[0])
-            side = self._classify_single_line(int(selected_x), width)
-            lane_width = self.last_lane_width or float(width) * self.SC_DEFAULT_LANE_WIDTH_FRACTION
-            if side == "left":
-                target = selected_x + lane_width / 2.0
-            else:
-                target = selected_x - lane_width / 2.0
-            target = sc_clamp(target, 0.0, float(width - 1))
+            self.last_left_x, self.last_right_x = int(left), int(right)
+            self.last_lane_width = float(max(1, right - left))
         else:
             self.path_mode = "search"
             self.curve_score_x = 0.0
-
+            self.lane_count = len(marks)  # Note: can be 2+ if the marks are too close for a pair
+            target = self._target_from_single_line(marks[0], width) if marks else None
         self.lane_target_x = target
 
-        # Draw center line + chosen target line for the stream.
+    def _target_from_single_line(self, x, width):
+        """Aim half a lane width beside a single visible lane line."""
+        lane_width = self.last_lane_width or float(width) * self.SC_DEFAULT_LANE_WIDTH_FRACTION
+        if self._classify_single_line(x, width) == "left":
+            target = x + lane_width / 2.0
+        else:
+            target = x - lane_width / 2.0
+        return sc_clamp(target, 0.0, float(width - 1))
+
+    def _draw_lane_target(self, height, width, marks_row):
+        """Draw the image center (blue) and the chosen target (green) for the stream."""
         center_x = int(width / 2)
         top = int(height * 0.46)
         cv2.line(self.frame, (center_x, height), (center_x, top), (255, 0, 0), 1)
         if self.lane_target_x is not None:
-            cv2.line(self.frame, (int(self.lane_target_x), height), (int(self.lane_target_x), top), (0, 255, 0), 2)
-        cv2.circle(self.frame, (center_x, best_row), 5, (255, 0, 0), -1)
-        self.stop_timer("lane_detection.detect_lanes")
-
-        self.start_timer("lane_detection.controller")
-        # Controller shall only be active while car is driving; when stopped
-        # the last steering angle (and therefore camera pan) is held.
-        if self.speed != 0:
-            self._lane_auto_steer(width)
-        self.stop_timer("lane_detection.controller")
+            target_x = int(self.lane_target_x)
+            cv2.line(self.frame, (target_x, height), (target_x, top), (0, 255, 0), 2)
+        cv2.circle(self.frame, (center_x, marks_row), 5, (255, 0, 0), -1)
 
     def _extract_lane_marks(self, mask, row):
-        """Find blue mark centers along one horizontal scan row."""
+        """Find blue mark centers along one horizontal scan row (sorted, in pixels)."""
         height, width = mask.shape[:2]
-        row_top = max(0, row - 1)
-        row_bottom = min(height, row + 2)
-        row_mask = np.max(mask[row_top:row_bottom], axis=0) > 0
-        padded = np.pad(row_mask.astype(np.int8), (1, 1), mode="constant")
-        changes = np.diff(padded)
-        starts = np.where(changes == 1)[0]
-        ends = np.where(changes == -1)[0]
+        # Merge three pixel rows so a single noisy row does not break a mark
+        band = mask[max(0, row - 1):min(height, row + 2)]
+        row_mask = np.max(band, axis=0) > 0
+        edges = np.diff(np.pad(row_mask.astype(np.int8), (1, 1), mode="constant"))
+        starts = np.where(edges == 1)[0]
+        ends = np.where(edges == -1)[0]
 
+        # Accept only tape-sized segments; limits are tuned for a 640px wide image
         scale = width / 640.0
         min_width = max(3, int(7 * scale))
         max_width = max(min_width + 1, int(95 * scale))
-        marks = []
-        for start, end in zip(starts, ends):
-            mark_width = end - start
-            if min_width <= mark_width <= max_width:
-                marks.append(int((start + end) / 2))
-        return sorted(marks)
+        return sorted(int((start + end) / 2) for start, end in zip(starts, ends)
+                      if min_width <= end - start <= max_width)
 
     def _choose_lane_pair(self, marks, min_pair_gap):
-        """Choose the widest valid pair of lane marks in one scan row."""
-        if len(marks) < 2:
-            return None
-        best_pair = None
-        best_gap = 0
-        for i in range(len(marks) - 1):
-            for j in range(i + 1, len(marks)):
-                gap = marks[j] - marks[i]
-                if gap >= min_pair_gap and gap > best_gap:
-                    best_pair = (marks[i], marks[j])
-                    best_gap = gap
-        return best_pair
+        """Choose the widest pair of lane marks that are at least min_pair_gap apart."""
+        pairs = [(left, right) for i, left in enumerate(marks) for right in marks[i + 1:]
+                 if right - left >= min_pair_gap]
+        return max(pairs, key=lambda pair: pair[1] - pair[0], default=None)
 
     def _classify_single_line(self, x, width):
         """Estimate whether a single visible line is the left or right lane line."""
         if self.last_left_x is not None and self.last_right_x is not None:
-            if abs(x - self.last_left_x) <= abs(x - self.last_right_x):
-                return "left"
-            return "right"
-        if x < width / 2:
-            return "left"
-        return "right"
+            closer_to_left = abs(x - self.last_left_x) <= abs(x - self.last_right_x)
+            return "left" if closer_to_left else "right"
+        return "left" if x < width / 2 else "right"
 
     def _lane_auto_steer(self, frame_width):
         """Fast curve response, damped straight response.
@@ -847,14 +675,12 @@ class SmartCar(object):
         it uses less filtering and larger allowed steering steps. Updates
         self.steer and then couples the camera pan to it.
         """
-        center_x = frame_width / 2.0
-
         if self.lane_target_x is None or self.lane_count < 2:
             self.path_mode = "search"
             self._update_camera_pan()
             return
 
-        error = float(self.lane_target_x) - center_x
+        error = float(self.lane_target_x) - frame_width / 2.0
         self.auto_error_x = error
 
         is_curve = (
@@ -864,25 +690,22 @@ class SmartCar(object):
         )
         alpha = self.SC_CURVE_FILTER_ALPHA if is_curve else self.SC_STRAIGHT_FILTER_ALPHA
         self.filtered_error_x = alpha * self.filtered_error_x + (1.0 - alpha) * error
-        control_error = self.filtered_error_x
 
-        if not is_curve and abs(control_error) <= self.SC_AUTO_TARGET_DEADBAND_PX:
+        if not is_curve and abs(self.filtered_error_x) <= self.SC_AUTO_TARGET_DEADBAND_PX:
             # Straight and close enough: do not zig-zag around the center.
             target_steer = self.SC_STEER_CENTER
             step_limit = self.SC_STRAIGHT_STEP_LIMIT
         else:
             gain_factor = self.SC_CURVE_GAIN_FACTOR if is_curve else self.SC_STRAIGHT_GAIN_FACTOR
-            steer_delta = control_error * self.SC_AUTO_STEER_GAIN * gain_factor
+            steer_delta = self.filtered_error_x * self.SC_AUTO_STEER_GAIN * gain_factor
             steer_delta = sc_clamp(steer_delta, -self.SC_AUTO_MAX_STEER_DELTA, self.SC_AUTO_MAX_STEER_DELTA)
             target_steer = sc_clamp(self.SC_STEER_CENTER + steer_delta, self.SC_STEER_MIN, self.SC_STEER_MAX)
             step_limit = self.SC_CURVE_STEP_LIMIT if is_curve else self.SC_MID_STEP_LIMIT
-
         self.auto_target_steer = target_steer
 
-        requested_change = self.auto_target_steer - self.steer
-        requested_change = sc_clamp(requested_change, -step_limit, step_limit)
-        self.steer = sc_clamp(self.steer + requested_change, self.SC_STEER_MIN, self.SC_STEER_MAX)
-
+        # Move toward the target, but never more than step_limit per frame
+        change = sc_clamp(target_steer - self.steer, -step_limit, step_limit)
+        self.steer = sc_clamp(self.steer + change, self.SC_STEER_MIN, self.SC_STEER_MAX)
         self._update_camera_pan()
 
     def _update_camera_pan(self):
@@ -890,7 +713,7 @@ class SmartCar(object):
 
         Deliberately absolute, not incremental: for every steering angle
         there is exactly one matching camera-pan angle, matching the Gruppe
-        3/8 implementation (gain 0.95, inverted).
+        3/8 implementation (gain 0.95).
         """
         steer_delta = float(self.steer) - self.SC_STEER_CENTER
         self.campan = sc_clamp(
@@ -899,70 +722,64 @@ class SmartCar(object):
             self.SC_PAN_MAX,
         )
 
-    # Starts the timer for a specified code block
-    # Stores the start time in the dictionary
+    # ------------------------------------------------------------------
+    # Performance measurement
+    # ------------------------------------------------------------------
+
     def start_timer(self, blockname):
+        """Store the start time of a code block (only when measuring performance)."""
         if self.measure_performance:
-            if blockname in self.time_consumptions:
-                self.time_consumptions[blockname].append(time.time())
-            else:
-                self.time_consumptions[blockname] = [time.time()]
-        
-    # Stops the timer for a specified code block
-    # Replaces the start time with the elapsed time in the dictionary
+            self.time_consumptions.setdefault(blockname, []).append(time.time())
+
     def stop_timer(self, blockname):
+        """Replace the block's start time with its elapsed time."""
         if self.measure_performance:
             if blockname in self.time_consumptions:
-                self.time_consumptions[blockname][-1] = time.time() - self.time_consumptions[blockname][-1]
+                times = self.time_consumptions[blockname]
+                times[-1] = time.time() - times[-1]
             else:
                 self.time_consumptions[blockname] = ["error"]
-    
-    # Only shows a camera window including recording option
+
+    @contextmanager
+    def _timed(self, blockname):
+        self.start_timer(blockname)
+        yield
+        self.stop_timer(blockname)
+
+    # ------------------------------------------------------------------
+    # Ready-made main loops
+    # ------------------------------------------------------------------
+
+    def _set_controls(self, drive, steer, camera, recording, ultrasonic):
+        self.drive_control = drive
+        self.steer_control = steer
+        self.camera_control = camera
+        self.recording_control = recording
+        self.use_ultrasonic = ultrasonic
+
+    def _manual_loop(self):
+        while True:
+            self.handle_sensors()
+            self.handle_window()
+            self.user_command()
+            if self.quit:
+                break
+            self.handle_actuators()
+
     def camera_window_loop(self):
-        # Redefine avaiable controls
-        self.drive_control = False
-        self.steer_control = False
-        self.camera_control = True
-        self.recording_control = True
-        self.use_ultrasonic = False
-        # Main loop for image processing
-        while(True): 
-            self.handle_sensors()
-            self.handle_window()
-            self.user_command()
-            if self.quit:
-                break
-            self.handle_actuators()
+        """Only show the camera window, with camera and recording controls."""
+        self._set_controls(drive=False, steer=False, camera=True, recording=True, ultrasonic=False)
+        self._manual_loop()
 
-    # Drive the car manually while showing a camera window
-    # The user can interact with the car using the keyboard:
-    # See variable 'text' for key assignments
     def drive_and_record_loop(self):
-        # Redefine avaiable controls
-        self.drive_control = True
-        self.steer_control = True
-        self.camera_control = True
-        self.recording_control = True
-        self.use_ultrasonic = True
-        while(True):
-            self.handle_sensors()
-            self.handle_window()
-            self.user_command()
-            if self.quit:
-                break
-            self.handle_actuators()
+        """Drive the car manually by keyboard while showing the camera window."""
+        self._set_controls(drive=True, steer=True, camera=True, recording=True, ultrasonic=True)
+        self._manual_loop()
 
-    # Drive the car manually while showing a camera window
-    # The user can interact with the car using the keyboard:
-    # See variable 'text' for key assignments
     def lane_detection_loop(self):
-        # Redefine avaiable controls
-        self.drive_control = True
-        self.steer_control = False
-        self.camera_control = True
-        self.recording_control = True
-        self.use_ultrasonic = True
-        while(True):
+        """Steer automatically along the lane; speed, camera and recording stay manual."""
+        self._set_controls(drive=True, steer=False, camera=True, recording=True, ultrasonic=True)
+        while True:
             self.handle_sensors()
             self.lane_detection()
             self.user_command()
@@ -970,4 +787,3 @@ class SmartCar(object):
                 break
             self.handle_actuators()
             self.handle_window()
-
