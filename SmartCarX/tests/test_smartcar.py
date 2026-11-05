@@ -1,8 +1,11 @@
 """
-Characterization tests for SmartCar.
+Characterization tests for SmartCar and its components.
 
-These pin down the behaviour of smartcar.py as it was before the refactor
-(including a few quirks), so the class can be restructured safely.
+These were written against the original single-class smartcar.py and pin
+down its behaviour (including a few quirks). When the class was split into
+components, only the attribute paths and patch targets changed; every
+scenario and expected value is unchanged.
+
 Run from the SmartCarX directory with either:
 
     python -m unittest discover tests
@@ -25,11 +28,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests import fakes  # noqa: E402
 
 cv2 = fakes.install()
+import displays  # noqa: E402
+import overlays  # noqa: E402
+import perf  # noqa: E402
+import recorder  # noqa: E402
 import smartcar  # noqa: E402
+from lane import LaneResult  # noqa: E402
 
 CALIBRATION_PATH = "/home/mendel/SmartCarX/calibration.txt"
 LANE_HSV = (100, 100, 150)    # inside the default HSV thresholds
 HEIGHT, WIDTH = 480, 640
+FIXED_LOCALTIME = (2026, 1, 2, 3, 4, 5, 0, 1, 0)
 
 
 def blank_frame():
@@ -55,12 +64,28 @@ def slanted_stripes(left, right, slope, width=20):
 
 
 def key(car, char):
-    """Feed one keypress through the local-window path of user_command."""
-    car.use_window = smartcar.SC_USE_LOCAL_WINDOW
+    """Feed one keypress through a local window into user_command."""
+    car.display = displays.LocalWindow()
     cv2.wait_key_result = ord(char)
     with redirect_stdout(io.StringIO()) as out:
         car.user_command()
     return out.getvalue()
+
+
+def stream_window(conn, *more_conns):
+    """StreamWindow on a mock server socket whose accept() hands out the given connections."""
+    server = mock.Mock()
+    server.accept.side_effect = [(c, ("10.0.0.%d" % (i + 2), 4242)) for i, c in enumerate((conn,) + more_conns)]
+    with redirect_stdout(io.StringIO()):
+        return displays.StreamWindow(server)
+
+
+def set_path(obj, dotted, value):
+    """set_path(car, "detector.last_left_x", 10) sets car.detector.last_left_x."""
+    *parents, name = dotted.split(".")
+    for parent in parents:
+        obj = getattr(obj, parent)
+    setattr(obj, name, value)
 
 
 class SmartCarTestCase(unittest.TestCase):
@@ -72,8 +97,10 @@ class SmartCarTestCase(unittest.TestCase):
         # Keep destructors (run at GC time) from writing CSV files into the repo
         # and from printing "Destructor called" all over the test output.
         with redirect_stdout(io.StringIO()):
-            while self.cars:
-                self.cars.pop().measure_performance = False
+            for car in self.cars:
+                car.timer.enabled = False
+            car = None
+            self.cars.clear()
             gc.collect()
 
     def make_car(self, **kwargs):
@@ -95,16 +122,22 @@ class ConstructionTests(SmartCarTestCase):
     def test_defaults(self):
         car = self.make_car()
         self.assertEqual((car.speed, car.steer, car.campan, car.camtilt), (0, 0, 0, 0))
-        self.assertEqual((car.distance, car.last_distance), (255, 255))
+        self.assertEqual((car.sensor.distance, car.sensor.last_distance), (255, 255))
         self.assertTrue(car.showhelp)
-        self.assertFalse(car.recording or car.calibration or car.quit)
-        self.assertEqual(list(car.upper_threshold), [116, 219, 255])
-        self.assertEqual(list(car.lower_threshold), [96, 21, 81])
+        self.assertFalse(car.recorder.recording or car.calibration.active or car.quit)
+        self.assertEqual(list(car.detector.upper_threshold), [116, 219, 255])
+        self.assertEqual(list(car.detector.lower_threshold), [96, 21, 81])
         self.assertEqual(car.debug_image, smartcar.SC_DEBUG_NONE)
-        self.assertEqual(car.path_mode, "search")
-        self.assertIsNone(car.lane_target_x)
-        self.assertIsNone(car.out)
-        self.assertEqual((car.frame_width, car.frame_height), (640, 480))
+        self.assertEqual(car.lane.path_mode, "search")
+        self.assertIsNone(car.lane.target_x)
+        self.assertIsNone(car.recorder.out)
+        self.assertEqual((car.camera.width, car.camera.height), (640, 480))
+        self.assertIsInstance(car.display, displays.NoWindow)
+
+    def test_default_thresholds_are_not_shared_between_cars(self):
+        first, second = self.make_car(), self.make_car()
+        first.detector.upper_threshold[0] += 1
+        self.assertEqual(second.detector.upper_threshold[0], 116)
 
     def test_camera_is_configured_for_fast_mjpg_capture(self):
         self.make_car()
@@ -126,13 +159,15 @@ class ConstructionTests(SmartCarTestCase):
         with mock.patch("builtins.open", mock.mock_open(read_data="8\n10\n6\n")) as opened:
             car = self.make_car()
         opened.assert_called_once_with(CALIBRATION_PATH, "r")
-        self.assertEqual((car.cal_steer, car.cal_pan, car.cal_tilt), (8, 10, 6))
+        cal = car.calibration
+        self.assertEqual((cal.steer, cal.pan, cal.tilt), (8, 10, 6))
         self.assertEqual(self.px.calls, [("steer", 8), ("pan", 10), ("tilt", 6)])
 
     def test_missing_calibration_file_is_ignored(self):
         with mock.patch("builtins.open", side_effect=FileNotFoundError):
             car = self.make_car()
-        self.assertEqual((car.cal_steer, car.cal_pan, car.cal_tilt), (0, 0, 0))
+        cal = car.calibration
+        self.assertEqual((cal.steer, cal.pan, cal.tilt), (0, 0, 0))
         self.assertEqual(self.px.calls, [])
 
     def test_tune_thresholds_prints_key_help_and_current_values(self):
@@ -148,12 +183,16 @@ class ConstructionTests(SmartCarTestCase):
         server = mock.Mock()
         conn = mock.Mock()
         server.accept.return_value = (conn, ("10.0.0.2", 4242))
-        with mock.patch.object(smartcar.socket, "socket", return_value=server):
+        with mock.patch.object(displays.socket, "socket", return_value=server):
             car = self.make_car(use_window=smartcar.SC_USE_STREAM_WINDOW)
         server.bind.assert_called_once_with(("0.0.0.0", 5001))
         server.listen.assert_called_once_with(5)
-        self.assertIs(car.conn, conn)
-        self.assertEqual(car.addr, ("10.0.0.2", 4242))
+        self.assertIs(car.display.conn, conn)
+        self.assertEqual(car.display.addr, ("10.0.0.2", 4242))
+
+    def test_local_window_option(self):
+        car = self.make_car(use_window=smartcar.SC_USE_LOCAL_WINDOW)
+        self.assertIsInstance(car.display, displays.LocalWindow)
 
 
 class KeyboardTests(SmartCarTestCase):
@@ -165,32 +204,32 @@ class KeyboardTests(SmartCarTestCase):
 
     def test_local_window_masks_key_code(self):
         car = self.make_car()
-        car.use_window = smartcar.SC_USE_LOCAL_WINDOW
+        car.display = displays.LocalWindow()
         cv2.wait_key_result = 0x100 | ord("q")
         car.user_command()
         self.assertTrue(car.quit)
 
     def test_stream_window_reads_key_from_socket(self):
         car = self.make_car(drive_control=True)
-        car.use_window = smartcar.SC_USE_STREAM_WINDOW
-        car.conn = mock.Mock()
-        car.conn.recv.return_value = b"w"
-        with mock.patch.object(smartcar.select, "select", return_value=([car.conn], [], [])) as sel:
+        conn = mock.Mock()
+        conn.recv.return_value = b"w"
+        car.display = stream_window(conn)
+        with mock.patch.object(displays.select, "select", return_value=([conn], [], [])) as sel:
             with redirect_stdout(io.StringIO()) as out:
                 car.user_command()
-        sel.assert_called_once_with([car.conn], [], [], 0.1)
-        car.conn.recv.assert_called_once_with(1)
+        sel.assert_called_once_with([conn], [], [], 0.1)
+        conn.recv.assert_called_once_with(1)
         self.assertIn("Received key: w", out.getvalue())
         self.assertEqual(car.speed, 10)
 
     def test_stream_window_ignores_socket_errors_and_idle_socket(self):
         car = self.make_car(drive_control=True)
-        car.use_window = smartcar.SC_USE_STREAM_WINDOW
-        car.conn = mock.Mock()
-        car.conn.recv.side_effect = OSError
-        with mock.patch.object(smartcar.select, "select", return_value=([car.conn], [], [])):
+        conn = mock.Mock()
+        conn.recv.side_effect = OSError
+        car.display = stream_window(conn)
+        with mock.patch.object(displays.select, "select", return_value=([conn], [], [])):
             car.user_command()
-        with mock.patch.object(smartcar.select, "select", return_value=([], [], [])):
+        with mock.patch.object(displays.select, "select", return_value=([], [], [])):
             car.user_command()
         self.assertEqual(car.speed, 0)
 
@@ -249,25 +288,26 @@ class KeyboardTests(SmartCarTestCase):
         car = self.make_car(steer_control=True, camera_control=True)
         car.steer = 10
         key(car, "c")
-        self.assertTrue(car.calibration)
+        self.assertTrue(car.calibration.active)
         self.assertEqual(car.steer, 0)
         key(car, "c")
-        self.assertFalse(car.calibration)
+        self.assertFalse(car.calibration.active)
 
     def test_c_works_with_only_camera_control(self):
         car = self.make_car(camera_control=True)
         key(car, "c")
-        self.assertTrue(car.calibration)
+        self.assertTrue(car.calibration.active)
 
     def test_calibration_keys_adjust_offsets_and_save_them(self):
         car = self.make_car(steer_control=True, camera_control=True)
-        car.calibration = True
+        car.calibration.active = True
         with mock.patch("builtins.open", mock.mock_open()) as opened:
             self.assertEqual(key(car, "a"), "steer: 0\n")
             key(car, "h")
             key(car, "h")
             key(car, "g")
-        self.assertEqual((car.cal_steer, car.cal_pan, car.cal_tilt), (-1, 2, -1))
+        cal = car.calibration
+        self.assertEqual((cal.steer, cal.pan, cal.tilt), (-1, 2, -1))
         self.assertEqual((car.steer, car.campan, car.camtilt), (0, 0, 0))
         opened.assert_called_with(CALIBRATION_PATH, "w+")
         self.assertEqual(opened.call_count, 4)
@@ -295,23 +335,23 @@ class KeyboardTests(SmartCarTestCase):
 
     def test_r_starts_and_stops_recording(self):
         car = self.make_car(recording_control=True)
-        with mock.patch.object(smartcar.time, "time", return_value=0.0), \
-             mock.patch.object(smartcar.time, "localtime", return_value=(2026, 1, 2, 3, 4, 5, 0, 1, 0)):
+        with mock.patch.object(recorder.time, "time", return_value=0.0), \
+             mock.patch.object(recorder.time, "localtime", return_value=FIXED_LOCALTIME):
             key(car, "r")
-        self.assertTrue(car.recording)
+        self.assertTrue(car.recorder.recording)
         writer = cv2.writers[-1]
-        self.assertIs(car.out, writer)
+        self.assertIs(car.recorder.out, writer)
         self.assertEqual(
             (writer.filename, writer.fourcc, writer.fps, writer.size),
             ("2026-01-02-03-04-05.avi", "MJPG", 10, (640, 480)))
         key(car, "r")
-        self.assertFalse(car.recording)
+        self.assertFalse(car.recorder.recording)
         self.assertTrue(writer.released)
 
     def test_r_needs_recording_control(self):
         car = self.make_car()
         key(car, "r")
-        self.assertFalse(car.recording)
+        self.assertFalse(car.recorder.recording)
 
     def test_threshold_tuning_keys(self):
         cases = {
@@ -327,18 +367,18 @@ class KeyboardTests(SmartCarTestCase):
                 car = self.make_car(tune_thresholds=True,
                                     upper_threshold=np.array([110, 200, 240]),
                                     lower_threshold=np.array([90, 30, 80]))
-                before = getattr(car, which + "_threshold").copy()
+                before = getattr(car.detector, which + "_threshold").copy()
                 out = key(car, char)
                 expected = before.copy()
                 expected[channel] += delta
-                self.assertEqual(list(getattr(car, which + "_threshold")), list(expected))
-                up, lo = car.upper_threshold, car.lower_threshold
+                self.assertEqual(list(getattr(car.detector, which + "_threshold")), list(expected))
+                up, lo = car.detector.upper_threshold, car.detector.lower_threshold
                 self.assertEqual(out, f"{up[0]} {up[1]} {up[2]}\n{lo[0]} {lo[1]} {lo[2]}\n")
 
     def test_threshold_keys_need_tuning_mode(self):
         car = self.make_car()
         key(car, "7")
-        self.assertEqual(list(car.upper_threshold), [116, 219, 255])
+        self.assertEqual(list(car.detector.upper_threshold), [116, 219, 255])
 
     def test_y_cycles_debug_image(self):
         car = self.make_car()
@@ -351,17 +391,17 @@ class KeyboardTests(SmartCarTestCase):
 
 
 class ServoTests(SmartCarTestCase):
-    def test_handle_servos_adds_calibration_and_clamps(self):
+    def test_apply_servos_adds_calibration_and_clamps(self):
         car = self.make_car()
         car.steer, car.campan, car.camtilt = 30, -30, 5
-        car.cal_steer, car.cal_pan, car.cal_tilt = 10, -10, 3
-        car.handle_servos()
+        car.calibration.steer, car.calibration.pan, car.calibration.tilt = 10, -10, 3
+        car.vehicle.apply_servos()
         self.assertEqual(self.px.calls, [("steer", 35), ("pan", -35), ("tilt", 8)])
 
     def test_center_servos_ramps_to_zero(self):
         car = self.make_car()
         car.steer, car.campan, car.camtilt = 20, -10, 7
-        car.center_servos()
+        car.vehicle.center_servos()
         expected = [int(20 - 20 * i / 100) for i in range(100)] + [0]
         self.assertEqual(self.px.servo_calls("steer"), expected)
         self.assertEqual(self.px.servo_calls("pan")[-1], 0)
@@ -383,17 +423,17 @@ class SensorAndActuatorTests(SmartCarTestCase):
         car = self.make_car(use_ultrasonic=True)
         self.px.ultrasonic.read.return_value = 42.4567
         car.handle_sensors()
-        self.assertEqual((car.distance, car.last_distance), (42.46, 255))
+        self.assertEqual((car.sensor.distance, car.sensor.last_distance), (42.46, 255))
 
     def test_ultrasonic_error_is_ignored_and_timeout_means_max(self):
         car = self.make_car()
         self.px.ultrasonic.read.return_value = -1
-        car.measure_us_distance()
-        self.assertEqual((car.distance, car.last_distance), (255, 255))
-        car.distance = 50
+        car.sensor.measure()
+        self.assertEqual((car.sensor.distance, car.sensor.last_distance), (255, 255))
+        car.sensor.distance = 50
         self.px.ultrasonic.read.return_value = -2
-        car.measure_us_distance()
-        self.assertEqual((car.distance, car.last_distance), (255, 50))
+        car.sensor.measure()
+        self.assertEqual((car.sensor.distance, car.sensor.last_distance), (255, 50))
 
     def test_drives_forward_or_backward(self):
         car = self.make_car()
@@ -408,10 +448,10 @@ class SensorAndActuatorTests(SmartCarTestCase):
     def test_emergency_stop_only_for_trusted_close_readings(self):
         car = self.make_car(use_ultrasonic=True)
         car.speed = 30
-        car.distance, car.last_distance = 10, 255   # jump > 100cm: not trusted
+        car.sensor.distance, car.sensor.last_distance = 10, 255   # jump > 100cm: not trusted
         car.handle_actuators()
         self.assertEqual(car.speed, 30)
-        car.distance, car.last_distance = 10, 15
+        car.sensor.distance, car.sensor.last_distance = 10, 15
         with redirect_stdout(io.StringIO()) as out:
             car.handle_actuators()
         self.assertEqual(car.speed, 0)
@@ -420,7 +460,7 @@ class SensorAndActuatorTests(SmartCarTestCase):
 
     def test_no_emergency_stop_when_reversing_or_sensor_off(self):
         car = self.make_car(use_ultrasonic=True)
-        car.distance, car.last_distance = 10, 15
+        car.sensor.distance, car.sensor.last_distance = 10, 15
         car.speed = -30
         car.handle_actuators()
         self.assertEqual(car.speed, -30)
@@ -428,25 +468,25 @@ class SensorAndActuatorTests(SmartCarTestCase):
         with redirect_stdout(io.StringIO()) as out:
             car.handle_actuators()
         self.assertEqual(out.getvalue(), "")
-        car.use_ultrasonic = False
+        car.controls.ultrasonic = False
         car.speed = 30
         car.handle_actuators()
         self.assertEqual(car.speed, 30)
 
     def test_recording_writes_the_clean_frame(self):
         car = self.make_car()
-        car.recording = True
-        car.out = fakes.FakeWriter("x.avi", "MJPG", 10, (640, 480))
+        car.recorder.recording = True
+        car.recorder.out = fakes.FakeWriter("x.avi", "MJPG", 10, (640, 480))
         car.recordingframe = blank_frame()
         car.handle_actuators()
-        self.assertEqual(len(car.out.written), 1)
-        self.assertIs(car.out.written[0], car.recordingframe)
+        self.assertEqual(len(car.recorder.out.written), 1)
+        self.assertIs(car.recorder.out.written[0], car.recordingframe)
 
 
 class WindowTests(SmartCarTestCase):
-    def window_car(self, use_window=smartcar.SC_USE_LOCAL_WINDOW, **kwargs):
+    def window_car(self, display=None, **kwargs):
         car = self.make_car(**kwargs)
-        car.use_window = use_window
+        car.display = display or displays.LocalWindow()
         car.ret, car.frame = True, blank_frame()
         return car
 
@@ -478,7 +518,7 @@ class WindowTests(SmartCarTestCase):
     def test_full_help_text(self):
         car = self.window_car(drive_control=True, steer_control=True, camera_control=True,
                               recording_control=True, use_ultrasonic=True)
-        car.distance = 12.345
+        car.sensor.distance = 12.345
         car.handle_window()
         self.assertEqual(self.texts(), [
             "Usage of the car control:",
@@ -507,7 +547,7 @@ class WindowTests(SmartCarTestCase):
         car.showhelp = False
         car.handle_window()
         car.showhelp = True
-        car.use_window = smartcar.SC_USE_NO_WINDOW
+        car.display = displays.NoWindow()
         car.handle_window()
         self.assertEqual(self.texts(), [])
         self.assertEqual(len(cv2.shown), 1)
@@ -522,57 +562,55 @@ class WindowTests(SmartCarTestCase):
     def test_recording_text_blinks(self):
         car = self.window_car()
         car.showhelp = False
-        car.recording = True
+        car.recorder.recording = True
         visible = []
         for now in (100.0, 100.2, 100.7, 101.1, 101.3):
             cv2.draw_calls.clear()
-            with mock.patch.object(smartcar.time, "time", return_value=now):
+            with mock.patch.object(overlays.time, "time", return_value=now):
                 car.handle_window()
             visible.append(self.texts() == ["recording"])
         self.assertEqual(visible, [False, True, False, False, True])
         cv2.draw_calls.clear()
-        with mock.patch.object(smartcar.time, "time", return_value=101.4):
+        with mock.patch.object(overlays.time, "time", return_value=101.4):
             car.handle_window()
         self.assertEqual(cv2.draw_calls[0][3:], ((10, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2))
 
     def test_calibration_text_blinks(self):
         car = self.window_car()
         car.showhelp = False
-        car.calibration = True
-        with mock.patch.object(smartcar.time, "time", return_value=100.0):
+        car.calibration.active = True
+        with mock.patch.object(overlays.time, "time", return_value=100.0):
             car.handle_window()
-        with mock.patch.object(smartcar.time, "time", return_value=100.2):
+        with mock.patch.object(overlays.time, "time", return_value=100.2):
             car.handle_window()
         self.assertEqual(self.texts(), ["calibrate servos"])
         self.assertEqual(cv2.draw_calls[0][3], (10, 420))
 
     def test_stream_window_sends_pickled_jpeg(self):
-        car = self.window_car(use_window=smartcar.SC_USE_STREAM_WINDOW)
-        car.conn = mock.Mock()
+        conn = mock.Mock()
+        car = self.window_car(display=stream_window(conn))
         car.handle_window()
         data = pickle.dumps(np.array([1, 2, 3], dtype=np.uint8))
-        car.conn.sendall.assert_called_once_with(b"IMG" + struct.pack(">L", len(data)) + data)
+        conn.sendall.assert_called_once_with(b"IMG" + struct.pack(">L", len(data)) + data)
         self.assertEqual(cv2.shown, [])
 
     def test_stream_window_reconnects_when_client_leaves(self):
-        car = self.window_car(use_window=smartcar.SC_USE_STREAM_WINDOW)
-        car.conn = mock.Mock()
-        car.conn.sendall.side_effect = BrokenPipeError
-        new_conn = mock.Mock()
-        car.server_socket = mock.Mock()
-        car.server_socket.accept.return_value = (new_conn, ("10.0.0.3", 1))
+        conn, new_conn = mock.Mock(), mock.Mock()
+        conn.sendall.side_effect = BrokenPipeError
+        car = self.window_car(display=stream_window(conn, new_conn))
         with redirect_stdout(io.StringIO()) as out:
             car.handle_window()
-        self.assertIs(car.conn, new_conn)
+        self.assertIs(car.display.conn, new_conn)
         self.assertIn("Server listening on 0.0.0.0:5001", out.getvalue())
-        self.assertIn("Connection from: ('10.0.0.3', 1)", out.getvalue())
+        self.assertIn("Connection from: ('10.0.0.3', 4242)", out.getvalue())
 
 
 class LaneDetectionTests(SmartCarTestCase):
     def detect(self, frame, speed=0, **state):
+        """Run lane_detection on `frame`; state keys are dotted paths, e.g. detector__last_left_x."""
         car = self.make_car()
         for name, value in state.items():
-            setattr(car, name, value)
+            set_path(car, name.replace("__", "."), value)
         car.speed = speed
         car.frame = frame
         car.lane_detection()
@@ -580,14 +618,15 @@ class LaneDetectionTests(SmartCarTestCase):
 
     def test_straight_lane_pair(self):
         car = self.detect(stripes(150, 490))
-        self.assertEqual(car.path_mode, "straight")
-        self.assertEqual((car.lane_seen, car.lane_count), (True, 2))
-        self.assertAlmostEqual(car.lane_target_x, 330.0)
-        self.assertEqual(car.curve_score_x, 0.0)
-        self.assertEqual((car.last_left_x, car.last_right_x, car.last_lane_width), (160, 500, 340.0))
+        self.assertEqual(car.lane.path_mode, "straight")
+        self.assertEqual((car.lane.lane_seen, car.lane.lane_count), (True, 2))
+        self.assertAlmostEqual(car.lane.target_x, 330.0)
+        self.assertEqual(car.lane.curve_score_x, 0.0)
+        d = car.detector
+        self.assertEqual((d.last_left_x, d.last_right_x, d.last_lane_width), (160, 500, 340.0))
 
     def test_detection_draws_scan_rows_marks_and_target(self):
-        car = self.detect(stripes(150, 490))
+        self.detect(stripes(150, 490))
         lines = [c for c in cv2.draw_calls if c[0] == "line"]
         circles = [c for c in cv2.draw_calls if c[0] == "circle"]
         self.assertEqual([l[2] for l in lines[:5]],
@@ -599,46 +638,49 @@ class LaneDetectionTests(SmartCarTestCase):
 
     def test_curve_is_detected_from_target_drift(self):
         car = self.detect(slanted_stripes(150, 490, slope=0.5))
-        self.assertEqual(car.path_mode, "curve")
-        self.assertAlmostEqual(car.curve_score_x, 67.0)
-        self.assertAlmostEqual(car.lane_target_x, 355.02)
+        self.assertEqual(car.lane.path_mode, "curve")
+        self.assertAlmostEqual(car.lane.curve_score_x, 67.0)
+        self.assertAlmostEqual(car.lane.target_x, 355.02)
 
     def test_single_line_uses_default_lane_width(self):
         car = self.detect(stripes(150))
-        self.assertEqual((car.path_mode, car.lane_count), ("search", 1))
-        self.assertAlmostEqual(car.lane_target_x, 160 + 640 * 0.55 / 2)
+        self.assertEqual((car.lane.path_mode, car.lane.lane_count), ("search", 1))
+        self.assertAlmostEqual(car.lane.target_x, 160 + 640 * 0.55 / 2)
 
     def test_single_line_is_classified_by_last_known_lines(self):
-        car = self.detect(stripes(150), last_left_x=10, last_right_x=200, last_lane_width=300.0)
-        self.assertAlmostEqual(car.lane_target_x, 10.0)     # right line: 160 - 150
+        car = self.detect(stripes(150), detector__last_left_x=10, detector__last_right_x=200,
+                          detector__last_lane_width=300.0)
+        self.assertAlmostEqual(car.lane.target_x, 10.0)     # right line: 160 - 150
 
     def test_single_line_target_is_clamped_to_frame(self):
-        car = self.detect(stripes(600), last_lane_width=300.0)
-        self.assertAlmostEqual(car.lane_target_x, 460.0)
-        car = self.detect(stripes(20), last_left_x=500, last_right_x=30, last_lane_width=300.0)
-        self.assertEqual(car.lane_target_x, 0.0)
+        car = self.detect(stripes(600), detector__last_lane_width=300.0)
+        self.assertAlmostEqual(car.lane.target_x, 460.0)
+        car = self.detect(stripes(20), detector__last_left_x=500, detector__last_right_x=30,
+                          detector__last_lane_width=300.0)
+        self.assertEqual(car.lane.target_x, 0.0)
 
     def test_close_marks_count_as_two_without_a_pair(self):
         car = self.detect(stripes(150, 240))
-        self.assertEqual((car.path_mode, car.lane_count), ("search", 2))
-        self.assertAlmostEqual(car.lane_target_x, 336.0)
+        self.assertEqual((car.lane.path_mode, car.lane.lane_count), ("search", 2))
+        self.assertAlmostEqual(car.lane.target_x, 336.0)
 
     def test_marks_too_narrow_or_wide_are_ignored(self):
         car = self.detect(stripes(150, 490, width=5))
-        self.assertIsNone(car.lane_target_x)
+        self.assertIsNone(car.lane.target_x)
         car = self.detect(stripes(150, width=120))
-        self.assertIsNone(car.lane_target_x)
+        self.assertIsNone(car.lane.target_x)
 
     def test_no_lane(self):
-        car = self.detect(blank_frame(), path_mode="curve", curve_score_x=50.0)
-        self.assertEqual((car.lane_seen, car.lane_count, car.path_mode), (False, 0, "search"))
-        self.assertIsNone(car.lane_target_x)
-        self.assertEqual(car.curve_score_x, 0.0)
+        car = self.detect(blank_frame(), lane=LaneResult(path_mode="curve", curve_score_x=50.0))
+        lane = car.lane
+        self.assertEqual((lane.lane_seen, lane.lane_count, lane.path_mode), (False, 0, "search"))
+        self.assertIsNone(lane.target_x)
+        self.assertEqual(lane.curve_score_x, 0.0)
 
     def test_widest_pair_wins(self):
         car = self.detect(stripes(50, 250, 590))
-        self.assertAlmostEqual(car.lane_target_x, 330.0)
-        self.assertEqual((car.last_left_x, car.last_right_x), (60, 600))
+        self.assertAlmostEqual(car.lane.target_x, 330.0)
+        self.assertEqual((car.detector.last_left_x, car.detector.last_right_x), (60, 600))
 
     def test_mask_debug_image(self):
         car = self.detect(stripes(150, 490), debug_image=smartcar.SC_DEBUG_MASK)
@@ -656,13 +698,14 @@ class LaneDetectionTests(SmartCarTestCase):
     def test_no_steering_while_stopped(self):
         car = self.detect(stripes(230, 570), steer=7, campan=-3)
         self.assertEqual((car.steer, car.campan), (7, -3))
-        self.assertEqual(car.filtered_error_x, 0.0)
+        self.assertEqual(car.steering.filtered_error_x, 0.0)
 
 
 class LaneControllerTests(SmartCarTestCase):
-    def drive(self, frame, **state):
+    def drive(self, frame, filtered_error_x=0.0, **state):
         car = self.make_car()
         car.speed = 30
+        car.steering.filtered_error_x = filtered_error_x
         for name, value in state.items():
             setattr(car, name, value)
         car.frame = frame
@@ -671,9 +714,9 @@ class LaneControllerTests(SmartCarTestCase):
 
     def test_small_straight_error_is_ignored(self):
         car = self.drive(stripes(150, 490))
-        self.assertAlmostEqual(car.auto_error_x, 10.0)
-        self.assertAlmostEqual(car.filtered_error_x, 1.8)
-        self.assertEqual((car.auto_target_steer, car.steer, car.campan), (0, 0, 0))
+        self.assertAlmostEqual(car.steering.auto_error_x, 10.0)
+        self.assertAlmostEqual(car.steering.filtered_error_x, 1.8)
+        self.assertEqual((car.steering.auto_target_steer, car.steer, car.campan), (0, 0, 0))
 
     def test_deadband_returns_slowly_to_center(self):
         car = self.drive(stripes(150, 490), steer=5)
@@ -682,22 +725,22 @@ class LaneControllerTests(SmartCarTestCase):
 
     def test_moderate_straight_error_steers_in_small_steps(self):
         car = self.drive(stripes(170, 510), filtered_error_x=40.0)
-        self.assertAlmostEqual(car.filtered_error_x, 38.2)
-        self.assertAlmostEqual(car.auto_target_steer, 38.2 * 0.22 * 0.38)
+        self.assertAlmostEqual(car.steering.filtered_error_x, 38.2)
+        self.assertAlmostEqual(car.steering.auto_target_steer, 38.2 * 0.22 * 0.38)
         self.assertAlmostEqual(car.steer, 3.0)
         self.assertAlmostEqual(car.campan, 2.85)
 
     def test_large_error_counts_as_curve(self):
         car = self.drive(stripes(220, 560))
-        self.assertEqual(car.path_mode, "straight")
-        self.assertAlmostEqual(car.filtered_error_x, 44.0)
-        self.assertAlmostEqual(car.auto_target_steer, 44.0 * 0.22 * 1.15)
+        self.assertEqual(car.lane.path_mode, "straight")
+        self.assertAlmostEqual(car.steering.filtered_error_x, 44.0)
+        self.assertAlmostEqual(car.steering.auto_target_steer, 44.0 * 0.22 * 1.15)
         self.assertAlmostEqual(car.steer, 6.5)
 
     def test_curve_steering(self):
         car = self.drive(slanted_stripes(150, 490, slope=0.5), steer=-3)
-        self.assertAlmostEqual(car.auto_error_x, 35.02)
-        self.assertAlmostEqual(car.filtered_error_x, 0.55 * 35.02)
+        self.assertAlmostEqual(car.steering.auto_error_x, 35.02)
+        self.assertAlmostEqual(car.steering.filtered_error_x, 0.55 * 35.02)
         self.assertAlmostEqual(car.steer, 3.5)
         self.assertAlmostEqual(car.campan, 3.5 * 0.95)
 
@@ -707,36 +750,36 @@ class LaneControllerTests(SmartCarTestCase):
         self.assertEqual(car.steer, 33)
         self.assertAlmostEqual(car.campan, 31.35)
         car = self.drive(stripes(400, 600), filtered_error_x=300.0, steer=33)
-        self.assertEqual(car.auto_target_steer, 35)
+        self.assertEqual(car.steering.auto_target_steer, 35)
         self.assertEqual(car.steer, 35)
 
     def test_lost_lane_only_couples_camera(self):
-        car = self.drive(blank_frame(), steer=-20, campan=0, path_mode="curve")
+        car = self.drive(blank_frame(), steer=-20, campan=0)
         self.assertEqual(car.steer, -20)
         self.assertEqual(car.campan, -19.0)
-        self.assertEqual(car.path_mode, "search")
+        self.assertEqual(car.lane.path_mode, "search")
 
 
 class PerformanceTests(SmartCarTestCase):
     def test_timers_are_off_by_default(self):
         car = self.make_car()
-        car.start_timer("x")
-        car.stop_timer("x")
-        self.assertEqual(car.time_consumptions, {})
+        car.timer.start("x")
+        car.timer.stop("x")
+        self.assertEqual(car.timer.timings, {})
 
     def test_timers_record_elapsed_time(self):
         car = self.make_car(measure_performance=True)
-        with mock.patch.object(smartcar.time, "time", side_effect=[10.0, 10.25, 11.0, 11.5]):
-            car.start_timer("x")
-            car.stop_timer("x")
-            car.start_timer("x")
-            car.stop_timer("x")
-        self.assertEqual(car.time_consumptions, {"x": [0.25, 0.5]})
+        with mock.patch.object(perf.time, "time", side_effect=[10.0, 10.25, 11.0, 11.5]):
+            car.timer.start("x")
+            car.timer.stop("x")
+            car.timer.start("x")
+            car.timer.stop("x")
+        self.assertEqual(car.timer.timings, {"x": [0.25, 0.5]})
 
     def test_stop_without_start_is_an_error_entry(self):
         car = self.make_car(measure_performance=True)
-        car.stop_timer("y")
-        self.assertEqual(car.time_consumptions, {"y": ["error"]})
+        car.timer.stop("y")
+        self.assertEqual(car.timer.timings, {"y": ["error"]})
 
     def test_timer_names(self):
         car = self.make_car(measure_performance=True, use_ultrasonic=True)
@@ -749,7 +792,7 @@ class PerformanceTests(SmartCarTestCase):
         car.handle_window()
         car.ret = True
         car.handle_window()
-        self.assertEqual(list(car.time_consumptions), [
+        self.assertEqual(list(car.timer.timings), [
             "handle_sensors.capture_image",
             "handle_sensors.measure_us_distance",
             "lane_detection.hsv",
@@ -765,40 +808,39 @@ class PerformanceTests(SmartCarTestCase):
             "handle_window.addrecording",
             "handle_window.imshow",
         ])
-        self.assertEqual(len(car.time_consumptions["handle_window.add_text"]), 1)
+        self.assertEqual(len(car.timer.timings["handle_window.add_text"]), 1)
 
 
 class ShutdownTests(SmartCarTestCase):
     def test_destructor_releases_everything_and_centers(self):
         car = self.make_car()
-        car.cal_steer = 4
+        car.calibration.steer = 4
         car.steer, car.campan, car.camtilt = 10, 10, 10
-        car.out = fakes.FakeWriter("x.avi", "MJPG", 10, (640, 480))
+        car.recorder.out = fakes.FakeWriter("x.avi", "MJPG", 10, (640, 480))
         with redirect_stdout(io.StringIO()) as out:
             car.__del__()
         self.assertEqual(out.getvalue(), "Destructor called\n")
         self.assertTrue(cv2.captures[-1].released)
-        self.assertTrue(car.out.released)
+        self.assertTrue(car.recorder.out.released)
         self.assertEqual(cv2.destroyed, 1)
         self.assertEqual(self.px.calls, [("stop",), ("steer", 4), ("pan", 0), ("tilt", 0)])
 
     def test_destructor_closes_stream_connection(self):
         car = self.make_car()
-        car.use_window = smartcar.SC_USE_STREAM_WINDOW
-        car.conn = mock.Mock()
+        conn = mock.Mock()
+        car.display = stream_window(conn)
         with redirect_stdout(io.StringIO()):
             car.__del__()
-        car.conn.close.assert_called_once_with()
+        conn.close.assert_called_once_with()
 
     def test_destructor_writes_time_consumption_csv(self):
         car = self.make_car(measure_performance=True)
-        car.time_consumptions = {"a": [0.5, 1.25], "b": [2.0]}
+        car.timer.timings = {"a": [0.5, 1.25], "b": [2.0]}
         with tempfile.TemporaryDirectory() as tmp:
             cwd = os.getcwd()
             os.chdir(tmp)
             try:
-                with mock.patch.object(smartcar.time, "localtime",
-                                       return_value=(2026, 1, 2, 3, 4, 5, 0, 1, 0)), \
+                with mock.patch.object(perf.time, "localtime", return_value=FIXED_LOCALTIME), \
                      redirect_stdout(io.StringIO()):
                     car.__del__()
                 with open("time_consumption-2026-01-02-03-04-05.csv") as f:
@@ -811,6 +853,7 @@ class ShutdownTests(SmartCarTestCase):
 class LoopTests(SmartCarTestCase):
     def run_loop(self, car, loop_name, iterations=2):
         calls = []
+
         def track(name):
             def step(*args):
                 calls.append(name)
@@ -824,8 +867,8 @@ class LoopTests(SmartCarTestCase):
         return calls
 
     def controls(self, car):
-        return (car.drive_control, car.steer_control, car.camera_control,
-                car.recording_control, car.use_ultrasonic)
+        c = car.controls
+        return (c.drive, c.steer, c.camera, c.recording, c.ultrasonic)
 
     def test_camera_window_loop(self):
         car = self.make_car(drive_control=True, steer_control=True, use_ultrasonic=True)
@@ -850,7 +893,9 @@ class LoopTests(SmartCarTestCase):
                                  "handle_sensors", "lane_detection", "user_command"])
 
 
-class HelperTests(unittest.TestCase):
+class PublicInterfaceTests(SmartCarTestCase):
+    """What the smartcar_0x scripts rely on."""
+
     def test_sc_clamp(self):
         self.assertEqual(smartcar.sc_clamp(5, 0, 3), 3)
         self.assertEqual(smartcar.sc_clamp(-5, 0, 3), 0)
@@ -861,6 +906,12 @@ class HelperTests(unittest.TestCase):
                          (0, 1, 2))
         self.assertEqual((smartcar.SC_USE_NO_WINDOW, smartcar.SC_USE_LOCAL_WINDOW,
                           smartcar.SC_USE_STREAM_WINDOW), (0, 1, 2))
+
+    def test_driving_state_is_shared_with_the_vehicle(self):
+        car = self.make_car()
+        car.speed, car.steer, car.campan, car.camtilt = 40, 5, -5, 3
+        v = car.vehicle
+        self.assertEqual((v.speed, v.steer, v.campan, v.camtilt), (40, 5, -5, 3))
 
 
 if __name__ == "__main__":
