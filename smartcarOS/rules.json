@@ -1,0 +1,24 @@
+{
+  "order": ["person_stop", "sign_stops", "speed_signs", "traffic_light", "avoid"],
+
+  "person_stop": {"labels": ["person"], "min_height": 0.5, "hold_s": 1.0},
+
+  "sign_stops": {
+    "signs": {
+      "stop_sign": {"mode": "always", "wait_s": 2.0},
+      "crosswalk": {"mode": "if_person"},
+      "school":    {"mode": "if_person"}
+    },
+    "min_height": 0.10, "person_min_height": 0.15, "sign_hold_s": 3.0, "rearm_s": 3.0
+  },
+
+  "speed_signs": {
+    "limits": {"speed_limit_20": 20, "speed_limit_30": 30, "speed_limit_50": 50, "end_speed_limit": null},
+    "min_height": 0.08, "hold_s": 20.0
+  },
+
+  "traffic_light": {"yellow_speed": 30, "hold_s": 1.0,
+                    "labels": {"red": "red", "yellow": "yellow", "green": "green"}},
+
+  "avoid": {"labels": ["banana"], "min_height": 0.2, "bias_deg": 18, "slow_speed": 20, "hold_s": 1.2}
+}

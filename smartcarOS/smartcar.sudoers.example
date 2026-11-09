@@ -1,0 +1,3 @@
+# Only needed if the user running Node-RED cannot use sudo without a password yet.
+# Install with:  sudo visudo -f /etc/sudoers.d/smartcar   (replace "pi" with the Node-RED user)
+pi ALL=(root) NOPASSWD: /bin/systemctl start smartcar, /bin/systemctl stop smartcar

@@ -1,0 +1,7 @@
+{
+  "camera_index": 1,
+  "max_speed": 60,
+  "auto_speed": 35,
+  "stream_port": 8080,
+  "detector": {"type": "null"}
+}

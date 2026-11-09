@@ -1,0 +1,15 @@
+[Unit]
+Description=SmartCar core
+After=network.target mosquitto.service
+
+[Service]
+User=mendel
+WorkingDirectory=/home/mendel/SmartCarX
+ExecStart=/usr/bin/python3 -m smartcore
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=8
+
+[Install]
+WantedBy=multi-user.target
